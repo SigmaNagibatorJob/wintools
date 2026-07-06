@@ -51,7 +51,7 @@ Or just double-click `start_en.bat` - it will ask for admin rights automatically
 
 ### Disclaimer
 
-Use at your own risk. This is a personal optimization tool built from real troubleshooting sessions, not an official Microsoft or Anthropic product. Always know what a setting does before disabling it.
+Use at your own risk. This is a personal optimization tool built from real troubleshooting sessions, not an official Microsoft product. Always know what a setting does before disabling it.
 
 ---
 
@@ -102,4 +102,4 @@ Set-ExecutionPolicy Bypass -Scope Process -Force; .\wintools_ru.ps1
 
 ### Отказ от ответственности
 
-Используй на свой страх и риск. Это личный инструмент оптимизации, собранный по итогам реальной настройки системы, а не официальный продукт Microsoft или Anthropic. Всегда узнавай что делает настройка перед тем как её отключить.
+Используй на свой страх и риск. Это личный инструмент оптимизации, собранный по итогам реальной настройки системы, а не официальный продукт Microsoft. Всегда узнавай что делает настройка перед тем как её отключить.
