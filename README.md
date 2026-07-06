@@ -13,7 +13,7 @@ WinTools is an interactive PowerShell menu for optimizing Windows 10/11: disable
 Open PowerShell **as Administrator** and run:
 
 ```powershell
-irm https://raw.githubusercontent.com/USERNAME/wintools/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/SigmaNagibatorJob/wintools/main/install.ps1 | iex
 ```
 
 ### Manual install
@@ -64,7 +64,7 @@ WinTools - интерактивное меню в PowerShell для оптими
 Открой PowerShell **от имени администратора** и выполни:
 
 ```powershell
-irm https://raw.githubusercontent.com/USERNAME/wintools/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/SigmaNagibatorJob/wintools/main/install.ps1 | iex
 ```
 
 ### Установка вручную
