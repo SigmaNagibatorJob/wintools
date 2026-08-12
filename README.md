@@ -1,4 +1,4 @@
-(https://github.com/user-attachments/files/30987912/README.md)# WinTools 2.0.0
+# WinTools 2.0.0
 
 Интерактивный PowerShell-инструмент для настройки, обслуживания и диагностики Windows 10/11.
 
