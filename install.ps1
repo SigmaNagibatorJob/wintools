@@ -14,7 +14,7 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 
 # --- Auto-detect Windows version ---
 function Get-WindowsVersionInfo {
-    $os = Get-WmiObject Win32_OperatingSystem
+    $os = Get-CimInstance Win32_OperatingSystem
     $caption = $os.Caption
     $build = $os.BuildNumber
 
@@ -24,8 +24,9 @@ function Get-WindowsVersionInfo {
         else                                { return @{Key="win10pro";   Name="Windows 10 Pro";             Build=$build} }
     }
     elseif ($caption -match "Windows 11") {
-        if ($caption -match "LTSC|Enterprise") { return @{Key="win11ltsc"; Name="Windows 11 Enterprise LTSC"; Build=$build} }
-        elseif ($caption -match "Insider")      { return @{Key="win11insider"; Name="Windows 11 InsiderPreview Pro"; Build=$build} }
+        if ($caption -match "Insider")          { return @{Key="win11insider"; Name="Windows 11 InsiderPreview Pro"; Build=$build} }
+        elseif ($caption -match "LTSC")         { return @{Key="win11ltsc"; Name="Windows 11 Enterprise LTSC"; Build=$build} }
+        elseif ($caption -match "Enterprise")   { return @{Key="win11enterprise"; Name="Windows 11 Enterprise"; Build=$build} }
         elseif ($caption -match "Pro")          { return @{Key="win11pro"; Name="Windows 11 Pro"; Build=$build} }
         elseif ($caption -match "Домашняя|Home") { return @{Key="win11home"; Name="Windows 11 Home"; Build=$build} }
         else                                    { return @{Key="win11pro"; Name="Windows 11 Pro"; Build=$build} }
@@ -94,8 +95,9 @@ $versions = @(
     @{Key="win10home";    Ru="Windows 10 Домашняя";       En="Windows 10 Home"}
     @{Key="win10pro";     Ru="Windows 10 Pro";            En="Windows 10 Pro"}
     @{Key="win11home";    Ru="Windows 11 Домашняя";       En="Windows 11 Home"}
-    @{Key="win11pro";     Ru="Windows 11 Pro";            En="Windows 11 Pro"}
-    @{Key="win11ltsc";    Ru="Windows 11 Enterprise LTSC"; En="Windows 11 Enterprise LTSC"}
+    @{Key="win11pro";       Ru="Windows 11 Pro";             En="Windows 11 Pro"}
+    @{Key="win11enterprise";Ru="Windows 11 Enterprise";      En="Windows 11 Enterprise"}
+    @{Key="win11ltsc";      Ru="Windows 11 Enterprise LTSC"; En="Windows 11 Enterprise LTSC"}
     @{Key="win11insider"; Ru="Windows 11 InsiderPreview Pro"; En="Windows 11 InsiderPreview Pro"}
 )
 
@@ -135,7 +137,7 @@ if (-not $selectedKey) {
 }
 
 # Step 3: Verify match
-if ($selectedKey -ne $detected.Key) {
+if ($detected.Key -ne "unknown" -and $selectedKey -ne $detected.Key) {
     $selName = ($versions | Where-Object { $_.Key -eq $selectedKey } | ForEach-Object { if ($langCode -eq "ru") { $_.Ru } else { $_.En } })
     Write-Host ""
     Write-Host ("  $($L.Mismatch)" -f $selName, $detected.Name) -ForegroundColor Red
@@ -161,9 +163,11 @@ Write-Host ""
 try {
     $scriptContent = Invoke-RestMethod $scriptUrl -ErrorAction Stop
     Write-Host "  $($L.Run)" -ForegroundColor Green
-    # Pass the detected Windows version to the script
-    $scriptContent = $scriptContent -replace '^\$WindowsVersion\s*=.*', "`$WindowsVersion = '$selectedKey'"
-    Invoke-Expression $scriptContent
+    # Compile the downloaded text and pass the selected version explicitly.
+    # This avoids Invoke-Expression and fixes the old replacement that never
+    # matched anything in the downloaded scripts.
+    $scriptBlock = [scriptblock]::Create($scriptContent)
+    & $scriptBlock -WindowsVersion $selectedKey
 } catch {
     Write-Host "  $($L.Error)" -ForegroundColor Red
     Write-Host "  $_" -ForegroundColor DarkGray
