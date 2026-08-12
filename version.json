@@ -1,0 +1,40 @@
+{
+  "version": "2.0.0",
+  "released": "2026-08-12",
+  "notes_en": [
+    "Safe system profiles and JSON configuration snapshots",
+    "Read-only diagnostics and winget application packs",
+    "Eight reversible Registry tweaks and fail-safe self-update"
+  ],
+  "notes_ru": [
+    "Безопасные профили системы и JSON-снимки конфигурации",
+    "Диагностика без изменений и пакеты приложений winget",
+    "Восемь обратимых твиков реестра и отказоустойчивое автообновление"
+  ],
+  "files": [
+    {
+      "path": "wintools_ru.ps1",
+      "sha256": "ed9f6229c5bb2e5bb17003c1df1091d34988900b9c80358dd15d24b9334ca217"
+    },
+    {
+      "path": "wintools_en.ps1",
+      "sha256": "21afeee94d7c410d4edff0d92c8607c53bc09a182e65f9da329bd6e052b12c43"
+    },
+    {
+      "path": "install.ps1",
+      "sha256": "f3060a369a938c2ded2c5a90f3dc4f0bcd5832fda215e48a84372f4b8d545730"
+    },
+    {
+      "path": "start_ru.bat",
+      "sha256": "3b2dc3102d3ff47f577e2bd1f4e7d18fd8d2d7a622c30aa04554af87868b208f"
+    },
+    {
+      "path": "start_en.bat",
+      "sha256": "5868f6faa0f40a99bf5d498460af1942052d8c21aabc03f0add05cca9c98fd5e"
+    },
+    {
+      "path": "README.md",
+      "sha256": "2799bff976a26044fa2e1aba989c4495aa6d0d234b263989eb512d1d45378b1c"
+    }
+  ]
+}
