@@ -1,7 +1,17 @@
 # WinTools - Оптимизация Windows (Русская версия)
 # Запускать от имени Администратора
-# Поддержка: Windows 10 Home/Pro, Windows 11 Home/Pro/LTSC/InsiderPreview
+# Поддержка: Windows 10 Home/Pro, Windows 11 Home/Pro/Enterprise/LTSC/InsiderPreview
 # Версия скрипта определяется автоматически или через install.ps1
+
+[CmdletBinding()]
+param(
+    [ValidateSet("win10home", "win10pro", "win11home", "win11pro", "win11enterprise", "win11ltsc", "win11insider")]
+    [string]$WindowsVersion
+)
+
+$Script:WinToolsVersion = "2.0.0"
+$Script:WinToolsLanguage = "ru"
+$Script:Repository = "SigmaNagibatorJob/wintools"
 
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host "  ОШИБКА: Запустите от имени Администратора!" -ForegroundColor Red
@@ -11,19 +21,35 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 # ============================================================
 # ОПРЕДЕЛЕНИЕ ВЕРСИИ WINDOWS
 # ============================================================
-function Get-WindowsVersion {
-    $os = Get-WmiObject Win32_OperatingSystem
-    $caption = $os.Caption
-    $build = $os.BuildNumber
+# Compatibility wrapper for Windows PowerShell 5.1 and PowerShell 7.
+function Get-WinToolsCimInstance {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, Position=0)]
+        [Alias("Class")]
+        [string]$ClassName,
+        [string]$Namespace = "root/cimv2"
+    )
 
+    $cimParams = @{ ClassName = $ClassName; Namespace = $Namespace }
+    if ($PSBoundParameters.ContainsKey("ErrorAction")) {
+        $cimParams.ErrorAction = $PSBoundParameters["ErrorAction"]
+    }
+    Get-CimInstance @cimParams
+}
+
+function Get-WindowsVersion {
+    $os = Get-WinToolsCimInstance Win32_OperatingSystem
+    $caption = $os.Caption
     if ($caption -match "Windows 10") {
         if ($caption -match "Pro")        { return "win10pro" }
         elseif ($caption -match "Домашняя|Home") { return "win10home" }
         else                                { return "win10pro" }
     }
     elseif ($caption -match "Windows 11") {
-        if ($caption -match "LTSC|Enterprise") { return "win11ltsc" }
-        elseif ($caption -match "Insider")      { return "win11insider" }
+        if ($caption -match "Insider")          { return "win11insider" }
+        elseif ($caption -match "LTSC")         { return "win11ltsc" }
+        elseif ($caption -match "Enterprise")   { return "win11enterprise" }
         elseif ($caption -match "Pro")          { return "win11pro" }
         elseif ($caption -match "Домашняя|Home") { return "win11home" }
         else                                    { return "win11pro" }
@@ -31,13 +57,14 @@ function Get-WindowsVersion {
     return "unknown"
 }
 
-$Script:WinVer = Get-WindowsVersion
+$Script:WinVer = if ($WindowsVersion) { $WindowsVersion } else { Get-WindowsVersion }
 $Script:WinVerName = switch ($Script:WinVer) {
     "win10home"    { "Windows 10 Домашняя" }
     "win10pro"     { "Windows 10 Pro" }
     "win11home"    { "Windows 11 Домашняя" }
-    "win11pro"     { "Windows 11 Pro" }
-    "win11ltsc"    { "Windows 11 Enterprise LTSC" }
+    "win11pro"        { "Windows 11 Pro" }
+    "win11enterprise" { "Windows 11 Enterprise" }
+    "win11ltsc"       { "Windows 11 Enterprise LTSC" }
     "win11insider" { "Windows 11 InsiderPreview Pro" }
     default        { "Неизвестная версия" }
 }
@@ -55,6 +82,7 @@ $Script:IsHome  = $Script:WinVer -match "home"
 function Write-OK($msg)   { Write-Host "  [+] $msg" -ForegroundColor Green }
 function Write-SKIP($msg) { Write-Host "  [-] $msg" -ForegroundColor DarkGray }
 function Write-INFO($msg) { Write-Host "  [*] $msg" -ForegroundColor Yellow }
+function Write-FAIL($msg) { Write-Host "  [!] $msg" -ForegroundColor Red }
 
 # ============================================================
 # ЖУРНАЛ ИЗМЕНЕНИЙ (для отмены действий)
@@ -68,53 +96,153 @@ if (-not (Test-Path $Global:LogPath)) {
 }
 
 function Write-ActionLog($type, $target, $oldValue, $desc) {
-    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $safeOld = if ($null -eq $oldValue) { "NULL" } else { "$oldValue" }
-    $safeDesc = ($desc -replace ",", ";")
-    $safeTarget = ($target -replace ",", ";")
-    "$ts,$type,$safeTarget,$safeOld,$safeDesc" | Out-File -FilePath $Global:LogPath -Append -Encoding UTF8
+    [pscustomobject]@{
+        Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        Type      = $type
+        Target    = $target
+        OldValue  = if ($null -eq $oldValue) { "NULL" } else { "$oldValue" }
+        Desc      = $desc
+    } | Export-Csv -Path $Global:LogPath -Append -NoTypeInformation -Encoding UTF8
 }
 
 function Set-RegLogged($path, $name, $value, $type, $desc) {
-    $old = (Get-ItemProperty -Path $path -Name $name -ErrorAction SilentlyContinue).$name
-    Write-ActionLog -type "Registry" -target "$path|$name" -oldValue $old -desc $desc
-    if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
-    Set-ItemProperty -Path $path -Name $name -Value $value -Type $type -ErrorAction SilentlyContinue
+    if (-not (Test-Path $path)) {
+        New-Item -Path $path -Force -ErrorAction Stop | Out-Null
+    }
+
+    $oldExists = $false
+    $old = $null
+    try {
+        $old = Get-ItemPropertyValue -Path $path -Name $name -ErrorAction Stop
+        $oldExists = $true
+    } catch {
+        $oldExists = $false
+    }
+
+    # Set-ItemProperty не поддерживает параметр -Type. Из-за него раньше
+    # почти все твики завершались ошибкой, после чего скрипт всё равно писал "успешно".
+    New-ItemProperty -Path $path -Name $name -Value $value -PropertyType $type -Force -ErrorAction Stop | Out-Null
+    $actual = Get-ItemPropertyValue -Path $path -Name $name -ErrorAction Stop
+    if ("$actual" -ne "$value") {
+        throw "Проверка реестра не пройдена: $path\$name (ожидалось '$value', получено '$actual')"
+    }
+
+    Write-ActionLog -type "Registry" -target "$path|$name" -oldValue $(if ($oldExists) { $old } else { $null }) -desc $desc
 }
 
 function Pause-Menu {
     Write-Host ""
     Write-Host "  [ Нажмите любую клавишу для возврата ]" -ForegroundColor DarkGray
-    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    try {
+        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    } catch {
+        $null = Read-Host
+    }
 }
 
 function Get-FolderSize($path) {
     if (-not (Test-Path $path)) { return 0 }
-    $s = (Get-ChildItem $path -Recurse -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer } | Measure-Object -Property Length -Sum -ErrorAction SilentlyContinue).Sum
+    $s = (Get-ChildItem $path -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer } | Measure-Object -Property Length -Sum -ErrorAction SilentlyContinue).Sum
     if (-not $s) { return 0 }
     return [math]::Round($s / 1GB, 2)
 }
 
 function Disable-Svc($name, $label) {
-    $found = Get-Service | Where-Object { $_.Name -like "$name*" } | Select-Object -First 1
-    if ($found -and $found.StartType -ne "Disabled") {
-        Write-ActionLog -type "Service" -target $found.Name -oldValue $found.StartType -desc $label
-        Stop-Service -Name $found.Name -Force -ErrorAction SilentlyContinue
-        Set-Service -Name $found.Name -StartupType Disabled -ErrorAction SilentlyContinue
+    $found = Get-Service -Name "$name*" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $found) {
+        Write-SKIP "Не найдено: $label"
+        return
+    }
+    if ($found.StartType -eq "Disabled") {
+        Write-SKIP "Уже отключено: $label"
+        return
+    }
+
+    try {
+        $oldStartType = $found.StartType
+        $oldStatus = $found.Status
+        if ($found.Status -ne "Stopped") {
+            Stop-Service -Name $found.Name -Force -ErrorAction Stop
+        }
+        Set-Service -Name $found.Name -StartupType Disabled -ErrorAction Stop
+        $found = Get-Service -Name $found.Name -ErrorAction Stop
+        if ($found.StartType -ne "Disabled") { throw "тип запуска не изменился" }
+        Write-ActionLog -type "Service" -target $found.Name -oldValue "$oldStartType|$oldStatus" -desc $label
         Write-OK "Отключено: $label"
-    } else {
-        Write-SKIP "Уже отключено или не найдено: $label"
+    } catch {
+        Write-FAIL "Не удалось отключить '$label': $($_.Exception.Message)"
+    }
+}
+
+function ConvertTo-NumberList($inputText, [int]$maxNumber) {
+    $numbers = @()
+    foreach ($rawToken in ($inputText -split ",")) {
+        $token = $rawToken.Trim()
+        if ($token -notmatch '^(\d+)(?:-(\d+))?$') {
+            throw "Неверный элемент: '$token'"
+        }
+        $first = [int]$matches[1]
+        $last = if ($matches[2]) { [int]$matches[2] } else { $first }
+        if ($first -lt 1 -or $last -lt $first -or $last -gt $maxNumber) {
+            throw "Номер или диапазон вне списка: '$token'"
+        }
+        for ($number = $first; $number -le $last; $number++) {
+            if ($numbers -notcontains $number) { $numbers += $number }
+        }
+    }
+    return $numbers
+}
+
+function Confirm-ActionPreview($lines) {
+    Write-Host ""
+    Write-Host "  +------------------ ПРЕДПРОСМОТР -------------------------------+" -ForegroundColor Cyan
+    foreach ($line in $lines) { Write-Host "  $line" -ForegroundColor White }
+    Write-Host "  +----------------------------------------------------------------+" -ForegroundColor Cyan
+    Write-Host "  Применить изменения? [Y/Д = да; N/Н/Enter = вернуться]: " -ForegroundColor Yellow -NoNewline
+    $answer = (Read-Host).Trim()
+    return $answer -match '^(?i:y|yes|д|да)$'
+}
+
+function Enable-Svc($name, $label) {
+    $found = Get-Service -Name "$name*" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $found) { Write-SKIP "Не найдено: $label"; return }
+    if ($found.StartType -ne "Disabled") { Write-SKIP "Уже включено: $label"; return }
+
+    try {
+        $oldStartType = "Manual"
+        $oldStatus = "Running"
+        $logEntries = @(Import-Csv -Path $Global:LogPath -ErrorAction SilentlyContinue | Where-Object {
+            $_.Type -eq "Service" -and $_.Target -eq $found.Name -and $_.OldValue -ne "NULL"
+        })
+        if ($logEntries.Count -gt 0) {
+            $parts = $logEntries[-1].OldValue -split "\|", 2
+            if ($parts[0] -and $parts[0] -ne "Disabled") { $oldStartType = $parts[0] }
+            if ($parts.Count -gt 1) { $oldStatus = $parts[1] }
+        }
+
+        Set-Service -Name $found.Name -StartupType $oldStartType -ErrorAction Stop
+        if ($oldStatus -eq "Running" -or $logEntries.Count -eq 0) {
+            try { Start-Service -Name $found.Name -ErrorAction Stop } catch {
+                Write-INFO "Тип запуска восстановлен, но службу не удалось запустить сейчас: $($_.Exception.Message)"
+            }
+        }
+        $restored = Get-Service -Name $found.Name -ErrorAction Stop
+        if ($restored.StartType -eq "Disabled") { throw "тип запуска остался Disabled" }
+        Write-ActionLog -type "Service" -target $found.Name -oldValue "Disabled|Stopped" -desc $label
+        Write-OK "Включено: $label ($($restored.StartType))"
+    } catch {
+        Write-FAIL "Не удалось включить '$label': $($_.Exception.Message)"
     }
 }
 
 function Get-StatusLine {
     $free    = [math]::Round((Get-PSDrive C -ErrorAction SilentlyContinue).Free/1GB,1)
-    $os      = Get-WmiObject Win32_OperatingSystem -ErrorAction SilentlyContinue
+    $os      = Get-WinToolsCimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
     $ramFree = [math]::Round($os.FreePhysicalMemory/1MB,1)
     $ramTotal= [math]::Round($os.TotalVisibleMemorySize/1MB,1)
     $ramUsed = [math]::Round($ramTotal - $ramFree,1)
     $proc    = (Get-Process -ErrorAction SilentlyContinue).Count
-    $cpu     = [math]::Round((Get-WmiObject Win32_Processor -ErrorAction SilentlyContinue | Measure-Object -Property LoadPercentage -Average).Average,0)
+    $cpu     = [math]::Round((Get-WinToolsCimInstance Win32_Processor -ErrorAction SilentlyContinue | Measure-Object -Property LoadPercentage -Average).Average,0)
     return "  Диск C: $free ГБ свободно   ОЗУ: $ramUsed/$ramTotal ГБ   ЦП: $cpu%   Процессов: $proc"
 }
 
@@ -244,7 +372,7 @@ function Menu-Services {
 
     Write-Host ""
     Write-Host "  +----------------------------------------------------------------+" -ForegroundColor DarkGray
-    Write-Host "  | Введи номера через запятую, чтобы ОТКЛЮЧИТЬ. Пример: 1,3,5-9   |" -ForegroundColor Cyan
+    Write-Host "  | Номера переключают службы: 1,3,5-9                            |" -ForegroundColor Cyan
     Write-Host "  | [A] Отключить все зелёные (рекомендуемые)                      |" -ForegroundColor Cyan
     Write-Host "  | [0] Назад в главное меню                                       |" -ForegroundColor DarkGray
     Write-Host "  +----------------------------------------------------------------+" -ForegroundColor DarkGray
@@ -254,34 +382,38 @@ function Menu-Services {
 
     if ($choice -eq "0" -or [string]::IsNullOrWhiteSpace($choice)) { return }
 
-    $toDisableNames = @()
-
-    if ($choice -eq "A" -or $choice -eq "a") {
-        $toDisableNames = $recommendedOff
-    } else {
-        $parts = $choice -split ","
-        foreach ($p in $parts) {
-            $p = $p.Trim()
-            if ($p -match "^(\d+)-(\d+)$") {
-                $from = [int]$matches[1]; $to = [int]$matches[2]
-                for ($n = $from; $n -le $to; $n++) {
-                    if ($indexMap.ContainsKey($n)) { $toDisableNames += $indexMap[$n] }
-                }
-            } elseif ($p -match "^\d+$") {
-                $n = [int]$p
-                if ($indexMap.ContainsKey($n)) { $toDisableNames += $indexMap[$n] }
-            }
+    $forceDisable = $choice -eq "A" -or $choice -eq "a"
+    try {
+        $selectedNames = if ($forceDisable) {
+            $recommendedOff
+        } else {
+            @(ConvertTo-NumberList $choice $svcList.Count | ForEach-Object { $indexMap[$_] })
         }
+    } catch {
+        Write-FAIL "Не удалось разобрать список: $($_.Exception.Message)"
+        Pause-Menu; Menu-Services; return
     }
 
-    Write-Host ""
-    if ($toDisableNames.Count -eq 0) {
-        Write-INFO "Ничего не выбрано"
-    } else {
-        foreach ($svcName in $toDisableNames) {
-            $desc = ($svcList | Where-Object { $_.N -eq $svcName }).Desc
-            Disable-Svc $svcName $desc
-        }
+    $plan = @()
+    foreach ($svcName in ($selectedNames | Select-Object -Unique)) {
+        $found = Get-Service -Name "$svcName*" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $found) { continue }
+        if ($forceDisable -and $found.StartType -eq "Disabled") { continue }
+        $desc = ($svcList | Where-Object { $_.N -eq $svcName }).Desc
+        $enable = if ($forceDisable) { $false } else { $found.StartType -eq "Disabled" }
+        $action = if ($enable) { "ВКЛЮЧИТЬ" } else { "ОТКЛЮЧИТЬ" }
+        $plan += [pscustomobject]@{Name=$svcName; Desc=$desc; Enable=$enable; Preview="[$action] $($found.Name) — $desc"}
+    }
+
+    if ($plan.Count -eq 0) {
+        Write-INFO "Ничего доступного не выбрано"
+        Pause-Menu; Menu-Services; return
+    }
+    if (-not (Confirm-ActionPreview ($plan.Preview))) { Menu-Services; return }
+
+    foreach ($item in $plan) {
+        if ($item.Enable) { Enable-Svc $item.Name $item.Desc }
+        else { Disable-Svc $item.Name $item.Desc }
     }
     Pause-Menu
 }
@@ -290,173 +422,387 @@ function Menu-Services {
 # МЕНЮ 2 - РЕЕСТР
 # ============================================================
 function Menu-Registry {
-    Draw-Header "ТВИКИ РЕЕСТРА - Производительность и приватность"
-    Write-Host "  Каждый твик улучшает производительность или убирает слежку." -ForegroundColor DarkGray
-    Write-Host "  [A] = применить все рекомендуемые сразу." -ForegroundColor DarkGray
+    Draw-Header "ТВИКИ РЕЕСТРА - включение, отключение и текущий статус"
+    Write-Host "  Статус [ВКЛ] означает, что оптимизационный твик применён." -ForegroundColor DarkGray
+    Write-Host "  Номер переключает твик; +номер включает; -номер возвращает стандартное поведение." -ForegroundColor DarkGray
     Write-Host ""
 
-    # Win10: Power Throttling может отсутствовать; Win11 LTSC: нет AdvertisingInfo
     $tweaks = @(
-        @{Num="1";  Rec=$true;  Desc="Планировщик GPU включён       Меньше задержек в играх"}
-        @{Num="2";  Rec=$true;  Desc="Алгоритм Нейгла выключен      Меньше пинг в играх"}
-        @{Num="3";  Rec=$true;  Desc="Power Throttling выключен      ЦП не душится в фоне"}
-        @{Num="4";  Rec=$true;  Desc="Game DVR выключен              Убирает оверхед записи Xbox"}
-        @{Num="5";  Rec=$true;  Desc="Визуальные эффекты минимум     Быстрее интерфейс"}
-        @{Num="6";  Rec=$true;  Desc="Быстрый запуск выключен        Настоящее выключение"}
-        @{Num="7";  Rec=$true;  Desc="Рекламный ID выключен          Убирает слежку по ID"}
-        @{Num="8";  Rec=$true;  Desc="Телеметрия выключена           Стоп отправка данных в MS"}
-        @{Num="9";  Rec=$false; Desc="OneDrive выключен              Отключает синхронизацию"}
-        @{Num="10"; Rec=$true;  Desc="Spotlight экран блокировки выкл Нет рекламы от Microsoft"}
-        @{Num="11"; Rec=$true;  Desc="Быстрое выключение 2 сек       Службы убиваются за 2с"}
-        @{Num="12"; Rec=$true;  Desc="Твики NTFS                     Меньше операций на диск"}
-        @{Num="13"; Rec=$true;  Desc="Автозапуск с USB выключен      Безопасность"}
-        @{Num="14"; Rec=$true;  Desc="Оптимизация доставки выкл      Не раздаёшь трафик другим"}
-        @{Num="15"; Rec=$true;  Desc="Персонализация ввода выкл      Не собирает нажатия клавиш"}
+        @{Num="1";  Rec=$true;  Desc="Планировщик GPU: меньше задержек в играх"}
+        @{Num="2";  Rec=$true;  Desc="Отключение Нейгла: меньше сетевых задержек"}
+        @{Num="3";  Rec=$true;  Desc="Отключение Power Throttling"}
+        @{Num="4";  Rec=$true;  Desc="Отключение Game DVR и фоновой записи"}
+        @{Num="5";  Rec=$true;  Desc="Минимум анимаций и визуальных эффектов"}
+        @{Num="6";  Rec=$true;  Desc="Отключение быстрого запуска Windows"}
+        @{Num="7";  Rec=$true;  Desc="Отключение рекламного идентификатора"}
+        @{Num="8";  Rec=$true;  Desc="Минимальная телеметрия и без запросов отзывов"}
+        @{Num="9";  Rec=$false; Desc="Отключение синхронизации OneDrive"}
+        @{Num="10"; Rec=$true;  Desc="Отключение Spotlight, советов и предложений"}
+        @{Num="11"; Rec=$true;  Desc="Таймаут завершения служб: 2 секунды"}
+        @{Num="12"; Rec=$true;  Desc="NTFS: без Last Access и имён 8.3"}
+        @{Num="13"; Rec=$true;  Desc="Отключение автозапуска со съёмных дисков"}
+        @{Num="14"; Rec=$true;  Desc="Отключение P2P оптимизации доставки"}
+        @{Num="15"; Rec=$true;  Desc="Отключение персонализации рукописного ввода"}
     )
-
-    # Win11: добавить классическое контекстное меню как твик
     if ($Script:IsWin11) {
-        $tweaks += @{Num="16"; Rec=$true; Desc="Классическое меню ПКМ (Win11)   Старое меню вместо нового"}
+        $tweaks += @{Num="16"; Rec=$true; Desc="Классическое контекстное меню Windows 11"}
+        $tweaks += @{Num="19"; Rec=$true; Desc="Отключение виджетов Windows 11"}
+    }
+
+    $tweaks += @(
+        @{Num="17"; Rec=$true;  Desc="Включение игрового режима Windows"}
+        @{Num="18"; Rec=$false; Desc="Отключение ускорения мыши"}
+        @{Num="20"; Rec=$true;  Desc="Отключение веб-поиска в меню Пуск"}
+        @{Num="21"; Rec=$false; Desc="Отключение фоновых приложений"}
+        @{Num="22"; Rec=$false; Desc="Отключение всплывающих уведомлений"}
+        @{Num="23"; Rec=$false; Desc="Отключение гибернации"}
+        @{Num="24"; Rec=$false; Desc="Показывать секунды в системных часах"}
+    )
+    $tweaks = @($tweaks | Sort-Object { [int]$_.Num })
+
+    function Get-RegistryValue($path, $name) {
+        try {
+            return Get-ItemPropertyValue -Path $path -Name $name -ErrorAction Stop
+        } catch {
+            return $null
+        }
+    }
+
+    function Get-ActiveTcpInterfaces {
+        $result = @()
+        $ifaces = Get-ChildItem "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces" -ErrorAction SilentlyContinue
+        foreach ($iface in $ifaces) {
+            $props = Get-ItemProperty $iface.PSPath -ErrorAction SilentlyContinue
+            $addresses = @($props.DhcpIPAddress) + @($props.IPAddress)
+            $ipv4 = $addresses | Where-Object {
+                $_ -match '^\d{1,3}(\.\d{1,3}){3}$' -and
+                $_ -notmatch '^(0\.0\.0\.0|127\.|169\.254\.)'
+            } | Select-Object -First 1
+            if ($ipv4) {
+                $result += [pscustomobject]@{Path=$iface.PSPath; IPv4=$ipv4}
+            }
+        }
+        return $result
+    }
+
+    function Get-TweakEnabled($num) {
+        switch ($num) {
+            "1" {
+                return (Get-RegistryValue "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" "HwSchMode") -eq 2
+            }
+            "2" {
+                $active = @(Get-ActiveTcpInterfaces)
+                if ($active.Count -eq 0) { return $false }
+                foreach ($iface in $active) {
+                    if ((Get-RegistryValue $iface.Path "TcpAckFrequency") -ne 1 -or
+                        (Get-RegistryValue $iface.Path "TCPNoDelay") -ne 1) {
+                        return $false
+                    }
+                }
+                return $true
+            }
+            "3" {
+                return (Get-RegistryValue "HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling" "PowerThrottlingOff") -eq 1
+            }
+            "4" {
+                return (Get-RegistryValue "HKCU:\System\GameConfigStore" "GameDVR_Enabled") -eq 0 -and
+                    (Get-RegistryValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR" "AppCaptureEnabled") -eq 0
+            }
+            "5" {
+                return (Get-RegistryValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" "VisualFXSetting") -eq 2 -and
+                    "$(Get-RegistryValue "HKCU:\Control Panel\Desktop" "MinAnimate")" -eq "0" -and
+                    (Get-RegistryValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarAnimations") -eq 0
+            }
+            "6" {
+                return (Get-RegistryValue "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" "HiberbootEnabled") -eq 0
+            }
+            "7" {
+                return (Get-RegistryValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo" "Enabled") -eq 0
+            }
+            "8" {
+                return (Get-RegistryValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" "AllowTelemetry") -eq 0 -and
+                    (Get-RegistryValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" "DoNotShowFeedbackNotifications") -eq 1
+            }
+            "9" {
+                return (Get-RegistryValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive" "DisableFileSyncNGSC") -eq 1
+            }
+            "10" {
+                $path = "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"
+                foreach ($name in @("RotatingLockScreenEnabled", "ContentDeliveryAllowed", "SubscribedContent-338387Enabled", "SubscribedContent-338388Enabled", "SubscribedContent-338389Enabled", "SilentInstalledAppsEnabled")) {
+                    if ((Get-RegistryValue $path $name) -ne 0) { return $false }
+                }
+                return $true
+            }
+            "11" {
+                return "$(Get-RegistryValue "HKLM:\SYSTEM\CurrentControlSet\Control" "WaitToKillServiceTimeout")" -eq "2000"
+            }
+            "12" {
+                $lastAccess = (& fsutil behavior query disablelastaccess 2>$null) -join " "
+                $shortNames = (& fsutil behavior query disable8dot3 2>$null) -join " "
+                return $lastAccess -match '(?i)DisableLastAccess\s*=\s*(?:0x)?1\b' -and
+                    $shortNames -match '(?i)Disable8dot3\s*=\s*(?:0x)?1\b'
+            }
+            "13" {
+                return (Get-RegistryValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer" "NoDriveTypeAutoRun") -eq 255
+            }
+            "14" {
+                return (Get-RegistryValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization" "DODownloadMode") -eq 0
+            }
+            "15" {
+                return (Get-RegistryValue "HKCU:\Software\Microsoft\InputPersonalization" "RestrictImplicitInkCollection") -eq 1 -and
+                    (Get-RegistryValue "HKCU:\Software\Microsoft\InputPersonalization" "RestrictImplicitTextCollection") -eq 1
+            }
+            "16" {
+                return Test-Path "HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32"
+            }
+            "17" {
+                return (Get-RegistryValue "HKCU:\Software\Microsoft\GameBar" "AllowAutoGameMode") -eq 1 -and
+                    (Get-RegistryValue "HKCU:\Software\Microsoft\GameBar" "AutoGameModeEnabled") -eq 1
+            }
+            "18" {
+                $path = "HKCU:\Control Panel\Mouse"
+                return "$(Get-RegistryValue $path "MouseSpeed")" -eq "0" -and
+                    "$(Get-RegistryValue $path "MouseThreshold1")" -eq "0" -and
+                    "$(Get-RegistryValue $path "MouseThreshold2")" -eq "0"
+            }
+            "19" {
+                return (Get-RegistryValue "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" "AllowNewsAndInterests") -eq 0
+            }
+            "20" {
+                return (Get-RegistryValue "HKCU:\Software\Policies\Microsoft\Windows\Explorer" "DisableSearchBoxSuggestions") -eq 1
+            }
+            "21" {
+                return (Get-RegistryValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications" "GlobalUserDisabled") -eq 1
+            }
+            "22" {
+                return (Get-RegistryValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\PushNotifications" "ToastEnabled") -eq 0
+            }
+            "23" {
+                return (Get-RegistryValue "HKLM:\SYSTEM\CurrentControlSet\Control\Power" "HibernateEnabled") -eq 0
+            }
+            "24" {
+                return (Get-RegistryValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowSecondsInSystemClock") -eq 1
+            }
+            default { return $false }
+        }
+    }
+
+    function Restart-ExplorerForTweak {
+        Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 500
+        Start-Process explorer.exe -ErrorAction Stop
+    }
+
+    function Set-TweakState($num, [bool]$enabled) {
+        try {
+            switch ($num) {
+                "1" {
+                    Set-RegLogged "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" "HwSchMode" $(if ($enabled) { 2 } else { 1 }) "DWord" "GPU Scheduling"
+                }
+                "2" {
+                    $active = @(Get-ActiveTcpInterfaces)
+                    if ($active.Count -eq 0) { throw "Не найден активный IPv4-интерфейс" }
+                    foreach ($iface in $active) {
+                        Set-RegLogged $iface.Path "TcpAckFrequency" $(if ($enabled) { 1 } else { 2 }) "DWord" "Nagle TcpAckFrequency"
+                        Set-RegLogged $iface.Path "TCPNoDelay" $(if ($enabled) { 1 } else { 0 }) "DWord" "Nagle TCPNoDelay"
+                    }
+                }
+                "3" {
+                    Set-RegLogged "HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling" "PowerThrottlingOff" $(if ($enabled) { 1 } else { 0 }) "DWord" "Power Throttling"
+                }
+                "4" {
+                    $value = if ($enabled) { 0 } else { 1 }
+                    Set-RegLogged "HKCU:\System\GameConfigStore" "GameDVR_Enabled" $value "DWord" "Game DVR"
+                    Set-RegLogged "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR" "AppCaptureEnabled" $value "DWord" "App Capture"
+                }
+                "5" {
+                    Set-RegLogged "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" "VisualFXSetting" $(if ($enabled) { 2 } else { 0 }) "DWord" "Visual FX"
+                    Set-RegLogged "HKCU:\Control Panel\Desktop" "MinAnimate" $(if ($enabled) { "0" } else { "1" }) "String" "MinAnimate"
+                    Set-RegLogged "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarAnimations" $(if ($enabled) { 0 } else { 1 }) "DWord" "Taskbar Animations"
+                    Restart-ExplorerForTweak
+                }
+                "6" {
+                    Set-RegLogged "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" "HiberbootEnabled" $(if ($enabled) { 0 } else { 1 }) "DWord" "Fast Startup"
+                }
+                "7" {
+                    Set-RegLogged "HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo" "Enabled" $(if ($enabled) { 0 } else { 1 }) "DWord" "Advertising ID"
+                }
+                "8" {
+                    $path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection"
+                    Set-RegLogged $path "AllowTelemetry" $(if ($enabled) { 0 } else { 1 }) "DWord" "Telemetry"
+                    Set-RegLogged $path "DoNotShowFeedbackNotifications" $(if ($enabled) { 1 } else { 0 }) "DWord" "Feedback Notifications"
+                }
+                "9" {
+                    Set-RegLogged "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive" "DisableFileSyncNGSC" $(if ($enabled) { 1 } else { 0 }) "DWord" "OneDrive"
+                }
+                "10" {
+                    $path = "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"
+                    $value = if ($enabled) { 0 } else { 1 }
+                    foreach ($name in @("RotatingLockScreenEnabled", "ContentDeliveryAllowed", "SubscribedContent-338387Enabled", "SubscribedContent-338388Enabled", "SubscribedContent-338389Enabled", "SilentInstalledAppsEnabled")) {
+                        Set-RegLogged $path $name $value "DWord" "Content Delivery: $name"
+                    }
+                }
+                "11" {
+                    Set-RegLogged "HKLM:\SYSTEM\CurrentControlSet\Control" "WaitToKillServiceTimeout" $(if ($enabled) { "2000" } else { "5000" }) "String" "Shutdown timeout"
+                }
+                "12" {
+                    & fsutil behavior set disablelastaccess $(if ($enabled) { 1 } else { 2 }) | Out-Null
+                    if ($LASTEXITCODE -ne 0) { throw "fsutil disablelastaccess: $LASTEXITCODE" }
+                    & fsutil behavior set disable8dot3 $(if ($enabled) { 1 } else { 2 }) | Out-Null
+                    if ($LASTEXITCODE -ne 0) { throw "fsutil disable8dot3: $LASTEXITCODE" }
+                    Write-ActionLog -type "FSUtil" -target "NTFS" -oldValue "unknown" -desc "NTFS last access + 8.3 names"
+                }
+                "13" {
+                    Set-RegLogged "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer" "NoDriveTypeAutoRun" $(if ($enabled) { 255 } else { 145 }) "DWord" "Autorun"
+                }
+                "14" {
+                    Set-RegLogged "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization" "DODownloadMode" $(if ($enabled) { 0 } else { 1 }) "DWord" "Delivery Optimization"
+                }
+                "15" {
+                    $path = "HKCU:\Software\Microsoft\InputPersonalization"
+                    $value = if ($enabled) { 1 } else { 0 }
+                    Set-RegLogged $path "RestrictImplicitInkCollection" $value "DWord" "Ink Collection"
+                    Set-RegLogged $path "RestrictImplicitTextCollection" $value "DWord" "Text Collection"
+                }
+                "16" {
+                    $root = "HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}"
+                    $path = "$root\InprocServer32"
+                    if ($enabled) {
+                        Set-RegLogged $path "(default)" "" "String" "Classic Context Menu"
+                    } elseif (Test-Path $root) {
+                        Remove-Item $root -Recurse -Force -ErrorAction Stop
+                        if (Test-Path $root) { throw "раздел реестра не удалён" }
+                        Write-ActionLog -type "RegistryKey" -target $root -oldValue "present" -desc "Classic Context Menu"
+                    }
+                    Restart-ExplorerForTweak
+                }
+                "17" {
+                    $value = if ($enabled) { 1 } else { 0 }
+                    Set-RegLogged "HKCU:\Software\Microsoft\GameBar" "AllowAutoGameMode" $value "DWord" "Game Mode"
+                    Set-RegLogged "HKCU:\Software\Microsoft\GameBar" "AutoGameModeEnabled" $value "DWord" "Game Mode"
+                }
+                "18" {
+                    $path = "HKCU:\Control Panel\Mouse"
+                    Set-RegLogged $path "MouseSpeed" $(if ($enabled) { "0" } else { "1" }) "String" "Mouse acceleration"
+                    Set-RegLogged $path "MouseThreshold1" $(if ($enabled) { "0" } else { "6" }) "String" "Mouse acceleration threshold 1"
+                    Set-RegLogged $path "MouseThreshold2" $(if ($enabled) { "0" } else { "10" }) "String" "Mouse acceleration threshold 2"
+                }
+                "19" {
+                    Set-RegLogged "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" "AllowNewsAndInterests" $(if ($enabled) { 0 } else { 1 }) "DWord" "Widgets"
+                }
+                "20" {
+                    Set-RegLogged "HKCU:\Software\Policies\Microsoft\Windows\Explorer" "DisableSearchBoxSuggestions" $(if ($enabled) { 1 } else { 0 }) "DWord" "Start web search"
+                }
+                "21" {
+                    Set-RegLogged "HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications" "GlobalUserDisabled" $(if ($enabled) { 1 } else { 0 }) "DWord" "Background applications"
+                }
+                "22" {
+                    Set-RegLogged "HKCU:\Software\Microsoft\Windows\CurrentVersion\PushNotifications" "ToastEnabled" $(if ($enabled) { 0 } else { 1 }) "DWord" "Toast notifications"
+                }
+                "23" {
+                    $oldValue = Get-RegistryValue "HKLM:\SYSTEM\CurrentControlSet\Control\Power" "HibernateEnabled"
+                    & powercfg /hibernate $(if ($enabled) { "off" } else { "on" }) | Out-Null
+                    if ($LASTEXITCODE -ne 0) { throw "powercfg /hibernate: $LASTEXITCODE" }
+                    Write-ActionLog -type "PowerCfg" -target "Hibernate" -oldValue $oldValue -desc "Hibernation"
+                }
+                "24" {
+                    Set-RegLogged "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowSecondsInSystemClock" $(if ($enabled) { 1 } else { 0 }) "DWord" "Clock seconds"
+                    Restart-ExplorerForTweak
+                }
+                default { throw "Неизвестный номер твика: $num" }
+            }
+
+            $actual = Get-TweakEnabled $num
+            if ($enabled -and -not $actual) { throw "проверка включения не пройдена" }
+            if (-not $enabled -and $actual) { throw "проверка отключения не пройдена" }
+            $stateText = if ($enabled) { "ВКЛЮЧЁН" } else { "ВЫКЛЮЧЕН" }
+            Write-OK "Твик [$num] $stateText"
+        } catch {
+            Write-FAIL "Не удалось изменить твик [$num]: $($_.Exception.Message)"
+        }
+    }
+
+    function ConvertTo-TweakActions($inputText) {
+        $actions = @()
+        foreach ($rawToken in ($inputText -split ",")) {
+            $token = $rawToken.Trim()
+            if ($token -notmatch '^([+-]?)(\d+)(?:-(\d+))?$') {
+                throw "Неверный элемент: '$token'"
+            }
+
+            $prefix = $matches[1]
+            $first = [int]$matches[2]
+            $last = if ($matches[3]) { [int]$matches[3] } else { $first }
+            if ($last -lt $first) { throw "Неверный диапазон: '$token'" }
+
+            $mode = if ($prefix -eq "+") {
+                "Enable"
+            } elseif ($prefix -eq "-") {
+                "Disable"
+            } else {
+                "Toggle"
+            }
+
+            for ($number = $first; $number -le $last; $number++) {
+                $num = "$number"
+                if ($tweaks.Num -notcontains $num) {
+                    throw "Такого номера твика нет: $num"
+                }
+                $actions += [pscustomobject]@{Num=$num; Mode=$mode}
+            }
+        }
+        return $actions
     }
 
     foreach ($t in $tweaks) {
         $tag = if ($t.Rec) { "[РЕК]" } else { "[ОПЦ]" }
-        $color = if ($t.Rec) { "Green" } else { "Yellow" }
-        $line = "  $tag [$($t.Num)] $($t.Desc)"
-        # Pad number to 2 digits
-        if ($t.Num.Length -eq 1) { $line = "  $tag [ $($t.Num)] $($t.Desc)" }
-        Write-Host $line -ForegroundColor $color
+        $enabled = Get-TweakEnabled $t.Num
+        $state = if ($enabled) { "[ВКЛ ]" } else { "[выкл]" }
+        $color = if ($enabled) { "Green" } elseif ($t.Rec) { "Yellow" } else { "DarkGray" }
+        Write-Host ("  {0} {1} [{2,2}] {3}" -f $state, $tag, $t.Num, $t.Desc) -ForegroundColor $color
     }
 
     $allRec = ($tweaks | Where-Object { $_.Rec }).Num
-
     Write-Host ""
     Write-Host "  +----------------------------------------------------------------+" -ForegroundColor DarkGray
-    Write-Host "  | [A]    Применить ВСЕ рекомендуемые твики сразу                |" -ForegroundColor Cyan
-    Write-Host "  | [1-$($tweaks.Count)] Применить конкретный твик                           |" -ForegroundColor White
-    Write-Host "  | [0]    Назад в главное меню                                   |" -ForegroundColor DarkGray
+    Write-Host "  | [N]  Переключить твик                                             |" -ForegroundColor White
+    Write-Host "  | [+N] Включить твик                                      |" -ForegroundColor Green
+    Write-Host "  | [-N] Отключить твик / вернуть стандарт                         |" -ForegroundColor Yellow
+    Write-Host ("  |  {0,-64}|" -f "Список: 2,-3,+4,5-7,+10-12") -ForegroundColor DarkCyan
+    Write-Host "  | [A]  Включить ВСЕ рекомендуемые твики                      |" -ForegroundColor Cyan
+    Write-Host "  | [0]  Назад в главное меню                                        |" -ForegroundColor DarkGray
     Write-Host "  +----------------------------------------------------------------+" -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  Выбор: " -ForegroundColor White -NoNewline
-    $choice = Read-Host
+    $choice = (Read-Host).Trim()
 
-    function Apply-Tweak($num) {
-        switch ($num) {
-            "1" {
-                Set-RegLogged "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" "HwSchMode" 2 "DWord" "Планировщик GPU"
-                Write-OK "Планировщик GPU включён"
-            }
-            "2" {
-                $ifaces = Get-ChildItem "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces" -ErrorAction SilentlyContinue
-                foreach ($iface in $ifaces) {
-                    $props = Get-ItemProperty $iface.PSPath -ErrorAction SilentlyContinue
-                    if ($props.DhcpIPAddress -like "192.168.*") {
-                        Set-RegLogged $iface.PSPath "TcpAckFrequency" 1 "DWord" "Nagle TcpAckFrequency"
-                        Set-RegLogged $iface.PSPath "TCPNoDelay" 1 "DWord" "Nagle TCPNoDelay"
-                        Write-OK "Алгоритм Нейгла выключен на $($props.DhcpIPAddress)"
-                    }
-                }
-            }
-            "3" {
-                $pt = "HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling"
-                if (-not (Test-Path $pt)) { New-Item -Path $pt -Force | Out-Null }
-                Set-RegLogged $pt "PowerThrottlingOff" 1 "DWord" "Power Throttling"
-                Write-OK "Power Throttling выключен"
-            }
-            "4" {
-                $gdvr = "HKCU:\System\GameConfigStore"
-                if (-not (Test-Path $gdvr)) { New-Item -Path $gdvr -Force | Out-Null }
-                Set-RegLogged $gdvr "GameDVR_Enabled" 0 "DWord" "Game DVR"
-                Set-RegLogged "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR" "AppCaptureEnabled" 0 "DWord" "App Capture"
-                Write-OK "Game DVR выключен"
-            }
-            "5" {
-                Set-RegLogged "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" "VisualFXSetting" 2 "DWord" "Visual FX"
-                Set-RegLogged "HKCU:\Control Panel\Desktop" "MinAnimate" "0" "String" "MinAnimate"
-                Set-RegLogged "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarAnimations" 0 "DWord" "Taskbar Animations"
-                Write-OK "Визуальные эффекты - максимальная производительность"
-            }
-            "6" {
-                Set-RegLogged "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" "HiberbootEnabled" 0 "DWord" "Fast Startup"
-                Write-OK "Быстрый запуск выключен"
-            }
-            "7" {
-                # LTSC может не иметь этого пути
-                $ad = "HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo"
-                if (-not (Test-Path $ad)) { New-Item -Path $ad -Force | Out-Null }
-                Set-RegLogged $ad "Enabled" 0 "DWord" "Advertising ID"
-                Write-OK "Рекламный ID выключен"
-            }
-            "8" {
-                $dc = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection"
-                if (-not (Test-Path $dc)) { New-Item -Path $dc -Force | Out-Null }
-                Set-RegLogged $dc "AllowTelemetry" 0 "DWord" "Telemetry"
-                Set-RegLogged $dc "DoNotShowFeedbackNotifications" 1 "DWord" "Feedback Notifications"
-                Write-OK "Телеметрия выключена"
-            }
-            "9" {
-                $od = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive"
-                if (-not (Test-Path $od)) { New-Item -Path $od -Force | Out-Null }
-                Set-RegLogged $od "DisableFileSyncNGSC" 1 "DWord" "OneDrive"
-                Write-OK "OneDrive выключен"
-            }
-            "10" {
-                $cdm = "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"
-                if (-not (Test-Path $cdm)) { New-Item -Path $cdm -Force | Out-Null }
-                Set-RegLogged $cdm "RotatingLockScreenEnabled" 0 "DWord" "Spotlight"
-                Set-RegLogged $cdm "ContentDeliveryAllowed" 0 "DWord" "Content Delivery"
-                Set-RegLogged $cdm "SubscribedContent-338387Enabled" 0 "DWord" "Tips"
-                Set-RegLogged $cdm "SubscribedContent-338388Enabled" 0 "DWord" "Suggestions"
-                Set-RegLogged $cdm "SubscribedContent-338389Enabled" 0 "DWord" "Suggestions2"
-                Set-RegLogged $cdm "SilentInstalledAppsEnabled" 0 "DWord" "Silent Installs"
-                Write-OK "Spotlight и реклама на экране блокировки выключены"
-            }
-            "11" {
-                Set-RegLogged "HKLM:\SYSTEM\CurrentControlSet\Control" "WaitToKillServiceTimeout" "2000" "String" "Shutdown timeout"
-                Write-OK "Таймаут выключения установлен 2 секунды"
-            }
-            "12" {
-                fsutil behavior set disablelastaccess 1 | Out-Null
-                fsutil behavior set disable8dot3 1 | Out-Null
-                Write-ActionLog -type "FSUtil" -target "NTFS" -oldValue "unknown" -desc "NTFS last access + 8.3 names"
-                Write-OK "NTFS: отключено время последнего доступа и имена 8.3"
-            }
-            "13" {
-                $ar = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer"
-                if (-not (Test-Path $ar)) { New-Item -Path $ar -Force | Out-Null }
-                Set-RegLogged $ar "NoDriveTypeAutoRun" 255 "DWord" "Autorun"
-                Write-OK "Автозапуск с USB отключён"
-            }
-            "14" {
-                $do = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization"
-                if (-not (Test-Path $do)) { New-Item -Path $do -Force | Out-Null }
-                Set-RegLogged $do "DODownloadMode" 0 "DWord" "Delivery Optimization"
-                Write-OK "Оптимизация доставки выключена"
-            }
-            "15" {
-                $ink = "HKCU:\Software\Microsoft\InputPersonalization"
-                if (-not (Test-Path $ink)) { New-Item -Path $ink -Force | Out-Null }
-                Set-RegLogged $ink "RestrictImplicitInkCollection" 1 "DWord" "Ink Collection"
-                Set-RegLogged $ink "RestrictImplicitTextCollection" 1 "DWord" "Text Collection"
-                Write-OK "Персонализация ввода выключена"
-            }
-            "16" {
-                # Win11 only: classic context menu
-                $classicMenuPath = "HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32"
-                if (-not (Test-Path $classicMenuPath)) { New-Item -Path $classicMenuPath -Force | Out-Null }
-                Set-RegLogged $classicMenuPath "(default)" "" "String" "Classic Context Menu"
-                Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
-                Start-Sleep -Milliseconds 500
-                Start-Process explorer
-                Write-OK "Классическое контекстное меню включено"
-            }
+    if ($choice -eq "0" -or [string]::IsNullOrWhiteSpace($choice)) { return }
+
+    try {
+        $actions = if ($choice -eq "A" -or $choice -eq "a") {
+            @($allRec | ForEach-Object { [pscustomobject]@{Num="$_"; Mode="Enable"} })
+        } else {
+            @(ConvertTo-TweakActions $choice)
         }
+    } catch {
+        Write-FAIL "Не удалось разобрать список: $($_.Exception.Message)"
+        Pause-Menu; Menu-Registry; return
     }
 
-    Write-Host ""
-    if ($choice -eq "A" -or $choice -eq "a") {
-        foreach ($n in $allRec) { Apply-Tweak $n }
-    } elseif ($choice -match "^\d+$") { Apply-Tweak $choice }
+    $plan = @()
+    foreach ($action in $actions) {
+        $requestedState = switch ($action.Mode) {
+            "Enable"  { $true }
+            "Disable" { $false }
+            default   { -not (Get-TweakEnabled $action.Num) }
+        }
+        $desc = ($tweaks | Where-Object { $_.Num -eq $action.Num }).Desc
+        $verb = if ($requestedState) { "ВКЛЮЧИТЬ ТВИК" } else { "ОТКЛЮЧИТЬ ТВИК" }
+        $plan += [pscustomobject]@{Num=$action.Num; Enabled=$requestedState; Preview="[$verb] [$($action.Num)] $desc"}
+    }
+
+    if (-not (Confirm-ActionPreview ($plan.Preview))) { Menu-Registry; return }
+    foreach ($item in $plan) { Set-TweakState $item.Num $item.Enabled }
     Pause-Menu
 }
 
@@ -502,25 +848,57 @@ function Menu-Tasks {
     Write-Host ""
     Write-Host "  +----------------------------------------------------------------+" -ForegroundColor DarkGray
     Write-Host "  | [A]    Отключить ВСЕ задачи                                   |" -ForegroundColor Cyan
-    Write-Host "  | [1-$($tasks.Count)] Отключить конкретную задачу                            |" -ForegroundColor White
+    Write-Host "  | Номера переключают задачи: 1,3,5-8                            |" -ForegroundColor White
     Write-Host "  | [0]    Назад в главное меню                                   |" -ForegroundColor DarkGray
     Write-Host "  +----------------------------------------------------------------+" -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  Выбор: " -ForegroundColor White -NoNewline
     $choice = Read-Host
 
-    $selected = @()
-    if ($choice -eq "A" -or $choice -eq "a") { $selected = $tasks }
-    elseif ($choice -match "^\d+$" -and [int]$choice -ge 1 -and [int]$choice -le $tasks.Count) { $selected = @($tasks[[int]$choice - 1]) }
+    if ($choice -eq "0" -or [string]::IsNullOrWhiteSpace($choice)) { return }
+    $forceDisable = $choice -eq "A" -or $choice -eq "a"
+    try {
+        $selected = if ($forceDisable) {
+            $tasks
+        } else {
+            @(ConvertTo-NumberList $choice $tasks.Count | ForEach-Object { $tasks[$_ - 1] })
+        }
+    } catch {
+        Write-FAIL "Не удалось разобрать список: $($_.Exception.Message)"
+        Pause-Menu; Menu-Tasks; return
+    }
 
-    Write-Host ""
+    $plan = @()
     foreach ($t in $selected) {
         $task = Get-ScheduledTask -TaskPath $t.Path -TaskName $t.Name -ErrorAction SilentlyContinue
-        if ($task -and $task.State -ne "Disabled") {
-            Write-ActionLog -type "Task" -target "$($t.Path)|$($t.Name)" -oldValue $task.State -desc $t.Name
-            Disable-ScheduledTask -TaskPath $t.Path -TaskName $t.Name -ErrorAction SilentlyContinue | Out-Null
-            Write-OK "Отключено: $($t.Name)"
-        } else { Write-SKIP "Уже отключено или не найдено: $($t.Name)" }
+        if (-not $task) { continue }
+        if ($forceDisable -and $task.State -eq "Disabled") { continue }
+        $enable = if ($forceDisable) { $false } else { $task.State -eq "Disabled" }
+        $verb = if ($enable) { "ВКЛЮЧИТЬ" } else { "ОТКЛЮЧИТЬ" }
+        $plan += [pscustomobject]@{Task=$t; Enable=$enable; OldState=$task.State; Preview="[$verb] $($t.Name) — $($t.Desc)"}
+    }
+    if ($plan.Count -eq 0) {
+        Write-INFO "Нет задач, состояние которых нужно изменить"
+        Pause-Menu; Menu-Tasks; return
+    }
+    if (-not (Confirm-ActionPreview ($plan.Preview))) { Menu-Tasks; return }
+
+    foreach ($item in $plan) {
+        $t = $item.Task
+        try {
+            if ($item.Enable) {
+                Enable-ScheduledTask -TaskPath $t.Path -TaskName $t.Name -ErrorAction Stop | Out-Null
+            } else {
+                Disable-ScheduledTask -TaskPath $t.Path -TaskName $t.Name -ErrorAction Stop | Out-Null
+            }
+            $task = Get-ScheduledTask -TaskPath $t.Path -TaskName $t.Name -ErrorAction Stop
+            if ($item.Enable -and $task.State -eq "Disabled") { throw "задача осталась отключённой" }
+            if (-not $item.Enable -and $task.State -ne "Disabled") { throw "задача осталась включённой" }
+            Write-ActionLog -type "Task" -target "$($t.Path)|$($t.Name)" -oldValue $item.OldState -desc $t.Name
+            Write-OK "$(if ($item.Enable) { 'Включено' } else { 'Отключено' }): $($t.Name)"
+        } catch {
+            Write-FAIL "Не удалось изменить $($t.Name): $($_.Exception.Message)"
+        }
     }
     Pause-Menu
 }
@@ -529,54 +907,92 @@ function Menu-Tasks {
 # МЕНЮ 4 - АВТОЗАПУСК
 # ============================================================
 function Menu-Startup {
-    Draw-Header "АВТОЗАПУСК - Программы запускающиеся при старте Windows"
-    Write-Host "  Введите номер программы чтобы убрать её из автозапуска." -ForegroundColor DarkGray
+    Draw-Header "АВТОЗАПУСК - включение и отключение без удаления"
+    Write-Host "  Номера переключают состояние. Отключённые записи хранятся в резервном подразделе реестра." -ForegroundColor DarkGray
     Write-Host ""
 
-    $regPaths = @(
-        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run",
-        "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run",
-        "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run"
+    $locations = @(
+        @{Path="HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"; Scope="HKCU"},
+        @{Path="HKLM:\Software\Microsoft\Windows\CurrentVersion\Run"; Scope="HKLM"},
+        @{Path="HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run"; Scope="HKLM32"}
     )
 
     $entries = @()
-    foreach ($path in $regPaths) {
-        $items = Get-ItemProperty -Path $path -ErrorAction SilentlyContinue
-        if ($items) {
-            $items.PSObject.Properties | Where-Object { $_.Name -notmatch "^PS" } | ForEach-Object {
-                $entries += @{Name=$_.Name; Value=$_.Value; Path=$path}
+    foreach ($location in $locations) {
+        $disabledPath = "$($location.Path)\WinToolsDisabled"
+        foreach ($source in @(
+            @{Path=$location.Path; Enabled=$true},
+            @{Path=$disabledPath; Enabled=$false}
+        )) {
+            $item = Get-ItemProperty -Path $source.Path -ErrorAction SilentlyContinue
+            if (-not $item) { continue }
+            $item.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' } | ForEach-Object {
+                $valueType = "String"
+                try { $valueType = (Get-Item $source.Path -ErrorAction Stop).GetValueKind($_.Name).ToString() } catch { $valueType = "String" }
+                $entries += [pscustomobject]@{
+                    Name=$_.Name; Value=$_.Value; Type=$valueType; Enabled=$source.Enabled
+                    SourcePath=$source.Path
+                    DestinationPath=$(if ($source.Enabled) { $disabledPath } else { $location.Path })
+                    Scope=$location.Scope
+                }
             }
         }
     }
 
     if ($entries.Count -eq 0) {
-        Write-INFO "Записей в автозапуске не найдено - всё чисто!"
+        Write-INFO "Записей автозапуска и резервных отключённых записей не найдено"
         Pause-Menu; return
     }
 
-    $i = 1
-    foreach ($e in $entries) {
-        $short = if ($e.Value.Length -gt 50) { $e.Value.Substring(0,47) + "..." } else { $e.Value }
-        Write-Host ("  [{0,2}] {1,-28}  {2}" -f $i, $e.Name, $short) -ForegroundColor White
-        $i++
+    for ($i = 0; $i -lt $entries.Count; $i++) {
+        $entry = $entries[$i]
+        $status = if ($entry.Enabled) { "[ВКЛ ]" } else { "[выкл]" }
+        $color = if ($entry.Enabled) { "Green" } else { "DarkGray" }
+        $valueText = "$($entry.Value)"
+        $short = if ($valueText.Length -gt 45) { $valueText.Substring(0,42) + "..." } else { $valueText }
+        Write-Host ("  [{0,2}] {1} [{2,-6}] {3,-25} {4}" -f ($i+1), $status, $entry.Scope, $entry.Name, $short) -ForegroundColor $color
     }
 
     Write-Host ""
     Write-Host "  +----------------------------------------------------------------+" -ForegroundColor DarkGray
-    Write-Host "  | Введите номер чтобы УБРАТЬ из автозапуска                     |" -ForegroundColor Yellow
+    Write-Host "  | Номера переключают записи: 1,3,5-8                            |" -ForegroundColor Cyan
     Write-Host "  | [0] Назад в главное меню                                      |" -ForegroundColor DarkGray
     Write-Host "  +----------------------------------------------------------------+" -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  Выбор: " -ForegroundColor White -NoNewline
-    $choice = Read-Host
+    $choice = (Read-Host).Trim()
+    if ($choice -eq "0" -or [string]::IsNullOrWhiteSpace($choice)) { return }
 
-    if ($choice -eq "0") { return }
-    if ($choice -match "^\d+$" -and [int]$choice -ge 1 -and [int]$choice -le $entries.Count) {
-        $entry = $entries[[int]$choice - 1]
-        Write-ActionLog -type "Startup" -target "$($entry.Path)|$($entry.Name)" -oldValue $entry.Value -desc $entry.Name
-        Remove-ItemProperty -Path $entry.Path -Name $entry.Name -ErrorAction SilentlyContinue
-        Write-OK "Убрано из автозапуска: $($entry.Name)"
-        Start-Sleep 1
+    try {
+        $selected = @(ConvertTo-NumberList $choice $entries.Count | ForEach-Object { $entries[$_ - 1] })
+    } catch {
+        Write-FAIL "Не удалось разобрать список: $($_.Exception.Message)"
+        Pause-Menu; Menu-Startup; return
+    }
+
+    $preview = @($selected | ForEach-Object {
+        $verb = if ($_.Enabled) { "ОТКЛЮЧИТЬ" } else { "ВКЛЮЧИТЬ" }
+        "[$verb] [$($_.Scope)] $($_.Name)"
+    })
+    if (-not (Confirm-ActionPreview $preview)) { Menu-Startup; return }
+
+    foreach ($entry in $selected) {
+        try {
+            if (-not (Test-Path $entry.DestinationPath)) {
+                New-Item -Path $entry.DestinationPath -Force -ErrorAction Stop | Out-Null
+            }
+            $destinationHasValue = $false
+            try { $null = Get-ItemPropertyValue -Path $entry.DestinationPath -Name $entry.Name -ErrorAction Stop; $destinationHasValue = $true } catch { $destinationHasValue = $false }
+            if ($destinationHasValue) { throw "в целевом разделе уже есть запись с таким именем" }
+            New-ItemProperty -Path $entry.DestinationPath -Name $entry.Name -Value $entry.Value -PropertyType $entry.Type -Force -ErrorAction Stop | Out-Null
+            Remove-ItemProperty -Path $entry.SourcePath -Name $entry.Name -ErrorAction Stop
+            $moved = Get-ItemPropertyValue -Path $entry.DestinationPath -Name $entry.Name -ErrorAction Stop
+            if ("$moved" -ne "$($entry.Value)") { throw "проверка перемещения не пройдена" }
+            Write-ActionLog -type "StartupToggle" -target "$($entry.SourcePath)|$($entry.DestinationPath)|$($entry.Name)" -oldValue $(if ($entry.Enabled) { "Enabled" } else { "Disabled" }) -desc $entry.Name
+            Write-OK "$(if ($entry.Enabled) { 'Отключено' } else { 'Включено' }): $($entry.Name)"
+        } catch {
+            Write-FAIL "Не удалось переключить $($entry.Name): $($_.Exception.Message)"
+        }
     }
     Pause-Menu
 }
@@ -647,22 +1063,66 @@ function Menu-DiskCleanup {
     $choice = Read-Host
 
     function Clean-Item($item) {
-        $isFile = (Test-Path $item.Path) -and (-not (Get-Item $item.Path -ErrorAction SilentlyContinue).PSIsContainer)
-        if ($isFile) { Remove-Item $item.Path -Force -ErrorAction SilentlyContinue }
-        else { Remove-Item "$($item.Path)\*" -Recurse -Force -ErrorAction SilentlyContinue }
-        Write-OK "Очищено: $($item.Label)"
+        if (-not (Test-Path $item.Path)) {
+            Write-SKIP "Не найдено: $($item.Label)"
+            return
+        }
+
+        $removeErrors = @()
+        $target = Get-Item $item.Path -Force -ErrorAction SilentlyContinue
+        if ($target -and -not $target.PSIsContainer) {
+            Remove-Item $item.Path -Force -ErrorAction SilentlyContinue -ErrorVariable +removeErrors
+        } else {
+            Get-ChildItem $item.Path -Force -ErrorAction SilentlyContinue |
+                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -ErrorVariable +removeErrors
+        }
+
+        if ($removeErrors.Count -gt 0) {
+            Write-INFO "Очищено частично: $($item.Label). Некоторые файлы заняты системой: $($removeErrors.Count)"
+        } else {
+            Write-OK "Очищено: $($item.Label)"
+        }
     }
 
-    Write-Host ""
+    $selectedItems = @()
+    if ($choice -eq "0" -or [string]::IsNullOrWhiteSpace($choice)) { return }
     if ($choice -eq "A" -or $choice -eq "a") {
-        Stop-Service wuauserv -Force -ErrorAction SilentlyContinue
-        Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 1
-        foreach ($item in $items) { if (Test-Path $item.Path) { Clean-Item $item } }
-        Start-Process explorer
+        $selectedItems = $items
     } elseif ($choice -match "^\d+$" -and [int]$choice -ge 1 -and [int]$choice -le $items.Count) {
-        $item = $items[[int]$choice - 1]
-        if (Test-Path $item.Path) { Clean-Item $item } else { Write-SKIP "Не найдено: $($item.Label)" }
+        $selectedItems = @($items[[int]$choice - 1])
+    } else {
+        Write-FAIL "Неверный выбор"
+        Pause-Menu; return
+    }
+
+    $updateCache = "C:\Windows\SoftwareDistribution\Download"
+    $explorerCache = "$env:USERPROFILE\AppData\Local\Microsoft\Windows\Explorer"
+    $needsWindowsUpdateStop = @($selectedItems | Where-Object { $_.Path -eq $updateCache }).Count -gt 0
+    $needsExplorerStop = @($selectedItems | Where-Object { $_.Path -eq $explorerCache }).Count -gt 0
+    $wuService = Get-Service -Name wuauserv -ErrorAction SilentlyContinue
+    $wuWasRunning = $wuService -and $wuService.Status -eq "Running"
+    $explorerWasRunning = $null -ne (Get-Process -Name explorer -ErrorAction SilentlyContinue | Select-Object -First 1)
+
+    Write-Host ""
+    try {
+        if ($needsWindowsUpdateStop -and $wuWasRunning) {
+            Stop-Service -Name wuauserv -Force -ErrorAction Stop
+        }
+        if ($needsExplorerStop -and $explorerWasRunning) {
+            Stop-Process -Name explorer -Force -ErrorAction Stop
+            Start-Sleep -Milliseconds 500
+        }
+        foreach ($item in $selectedItems) { Clean-Item $item }
+    } catch {
+        Write-FAIL $_.Exception.Message
+    } finally {
+        # The old implementation stopped Windows Update and never started it again.
+        if ($needsWindowsUpdateStop -and $wuWasRunning) {
+            Start-Service -Name wuauserv -ErrorAction SilentlyContinue
+        }
+        if ($needsExplorerStop -and $explorerWasRunning -and -not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) {
+            Start-Process explorer.exe
+        }
     }
 
     $freeAfter = [math]::Round((Get-PSDrive C).Free/1GB,1)
@@ -682,12 +1142,12 @@ function Menu-Monitor {
         Write-Host ""
         Write-Host "  +================================================================+" -ForegroundColor Cyan
         Write-Host "  |               ЖИВОЙ МОНИТОР СИСТЕМЫ                           |" -ForegroundColor Cyan
-        Write-Host "  |          Нажмите Q + Enter чтобы выйти                        |" -ForegroundColor DarkGray
+        Write-Host "  |          Нажмите Q чтобы выйти                        |" -ForegroundColor DarkGray
         Write-Host "  +================================================================+" -ForegroundColor Cyan
         Write-Host ""
 
-        $os       = Get-WmiObject Win32_OperatingSystem -ErrorAction SilentlyContinue
-        $cpu      = [math]::Round((Get-WmiObject Win32_Processor -ErrorAction SilentlyContinue | Measure-Object -Property LoadPercentage -Average).Average,0)
+        $os       = Get-WinToolsCimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+        $cpu      = [math]::Round((Get-WinToolsCimInstance Win32_Processor -ErrorAction SilentlyContinue | Measure-Object -Property LoadPercentage -Average).Average,0)
         $ramTotal = [math]::Round($os.TotalVisibleMemorySize/1MB,1)
         $ramFree  = [math]::Round($os.FreePhysicalMemory/1MB,1)
         $ramUsed  = [math]::Round($ramTotal - $ramFree,1)
@@ -748,7 +1208,7 @@ function Menu-Monitor {
         Show-Bool "Быстрый запуск выкл     (нужно 0, сейчас $fs)"   $fs   0
 
         Write-Host ""
-        Write-Host ("  Обновлено: {0}  |  Обновление через 3с...  |  Q + Enter для выхода" -f (Get-Date -Format "HH:mm:ss")) -ForegroundColor DarkGray
+        Write-Host ("  Обновлено: {0}  |  Обновление через 3с...  |  Q для выхода" -f (Get-Date -Format "HH:mm:ss")) -ForegroundColor DarkGray
 
         $startTime = Get-Date
         while ((Get-Date) -lt $startTime.AddSeconds(3)) {
@@ -767,11 +1227,11 @@ function Menu-Monitor {
 function Menu-PowerPlan {
     Draw-Header "СХЕМА ПИТАНИЯ - Режим максимальной производительности"
     Write-Host "  Активная схема:" -ForegroundColor DarkGray
-    $current = powercfg /getactivescheme
+    $current = & powercfg /getactivescheme 2>&1
     Write-Host "  $current" -ForegroundColor Yellow
     Write-Host ""
     Write-Host "  Все доступные схемы:" -ForegroundColor DarkGray
-    powercfg /list | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+    & powercfg /list 2>&1 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
     Write-Host ""
     Write-Host "  +----------------------------------------------------------------+" -ForegroundColor DarkGray
     Write-Host "  | [1] Активировать Максимальная производительность               |" -ForegroundColor Green
@@ -783,15 +1243,36 @@ function Menu-PowerPlan {
 
     if ($choice -eq "1") {
         Write-Host ""
-        $existing = powercfg /list | Select-String "Ultimate"
-        if (-not $existing) {
-            powercfg -duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 | Out-Null
-            Write-OK "Схема Максимальная производительность создана"
+        $guidPattern = '(?i)\b[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\b'
+        $schemeLine = & powercfg /list 2>&1 | Where-Object { "$_" -match '(?i)Ultimate Performance|Максимальн.*производитель' } | Select-Object -First 1
+        $guid = $null
+        if ("$schemeLine" -match $guidPattern) { $guid = $matches[0] }
+
+        if (-not $guid) {
+            $duplicateOutput = & powercfg /duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                Write-FAIL "Не удалось создать схему: $($duplicateOutput -join ' ')"
+                Pause-Menu; return
+            }
+            if (($duplicateOutput -join ' ') -match $guidPattern) { $guid = $matches[0] }
+            if ($guid) { Write-OK "Схема Максимальная производительность создана" }
         }
-        $guid = ((powercfg /list | Select-String "Ultimate") -replace ".*GUID: ([^\s]+).*", '$1').Trim()
-        if ($guid) {
-            powercfg /setactive $guid
-            Write-OK "Схема Максимальная производительность активирована"
+
+        if (-not $guid) {
+            Write-FAIL "Windows не вернула GUID созданной схемы питания"
+            Pause-Menu; return
+        }
+
+        $activateOutput = & powercfg /setactive $guid 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-FAIL "Не удалось активировать схему: $($activateOutput -join ' ')"
+        } else {
+            $active = & powercfg /getactivescheme 2>&1
+            if (($active -join ' ') -match [regex]::Escape($guid)) {
+                Write-OK "Схема Максимальная производительность активирована"
+            } else {
+                Write-FAIL "Команда выполнена, но активная схема не изменилась"
+            }
         }
     }
     Pause-Menu
@@ -803,19 +1284,25 @@ function Menu-PowerPlan {
 function Menu-SMB {
     Draw-Header "БЕЗОПАСНОСТЬ SMB1 - Отключить уязвимый протокол"
     Write-Host "  SMB1 - старый протокол с серьёзными уязвимостями." -ForegroundColor DarkGray
-    Write-Host "  Использовался вирусом WannaCry. Вам он не нужен." -ForegroundColor DarkGray
+    Write-Host "  Использовался вирусом WannaCry. Для старых NAS он может быть нужен." -ForegroundColor DarkGray
     Write-Host ""
 
-    $smb    = Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -ErrorAction SilentlyContinue
-    $status = if ($smb) { $smb.State } else { "Неизвестно" }
-    $color  = if ($status -eq "Disabled") { "Green" } else { "Red" }
+    try {
+        $smb = Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -ErrorAction Stop
+    } catch {
+        Write-FAIL "Не удалось прочитать состояние SMB1: $($_.Exception.Message)"
+        Pause-Menu; return
+    }
+    $status = $smb.State
+    $safe = $status -eq "Disabled" -or $status -eq "DisablePending"
+    $color = if ($safe) { "Green" } else { "Red" }
     Write-Host ("  Статус SMB1: [ {0} ]" -f $status) -ForegroundColor $color
     Write-Host ""
 
-    if ($status -ne "Disabled") {
+    if (-not $safe) {
         Write-Host "  +----------------------------------------------------------------+" -ForegroundColor Red
         Write-Host "  | SMB1 ВКЛЮЧЁН - это угроза безопасности!                       |" -ForegroundColor Red
-        Write-Host "  | [1] Отключить SMB1 СЕЙЧАС - настоятельно рекомендуется        |" -ForegroundColor Green
+        Write-Host "  | [1] Отключить SMB1 СЕЙЧАС                                     |" -ForegroundColor Green
         Write-Host "  | [0] Назад в главное меню                                      |" -ForegroundColor DarkGray
         Write-Host "  +----------------------------------------------------------------+" -ForegroundColor Red
         Write-Host ""
@@ -823,12 +1310,26 @@ function Menu-SMB {
         $choice = Read-Host
         if ($choice -eq "1") {
             Write-Host ""
-            Disable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol" -NoRestart -ErrorAction SilentlyContinue | Out-Null
-            Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force -ErrorAction SilentlyContinue
-            Write-OK "SMB1 отключён - требуется перезагрузка"
+            try {
+                Disable-WindowsOptionalFeature -Online -FeatureName "SMB1Protocol" -NoRestart -ErrorAction Stop | Out-Null
+                try {
+                    Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force -ErrorAction Stop | Out-Null
+                } catch {
+                    Write-INFO "Компонент отключён, но серверную настройку проверить не удалось: $($_.Exception.Message)"
+                }
+                $after = Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -ErrorAction Stop
+                if ($after.State -eq "Disabled" -or $after.State -eq "DisablePending") {
+                    Write-OK "SMB1 отключён. Если статус DisablePending, требуется перезагрузка."
+                } else {
+                    Write-FAIL "SMB1 остался в состоянии $($after.State)"
+                }
+            } catch {
+                Write-FAIL "Не удалось отключить SMB1: $($_.Exception.Message)"
+            }
         }
     } else {
-        Write-Host "  Всё в порядке. SMB1 уже отключён." -ForegroundColor Green
+        Write-OK "SMB1 уже отключён."
+        if ($status -eq "DisablePending") { Write-INFO "Для завершения нужна перезагрузка." }
     }
     Pause-Menu
 }
@@ -854,11 +1355,11 @@ function Menu-Health {
                 $tColor = if ($rel.Temperature -gt 60) { "Red" } elseif ($rel.Temperature -gt 45) { "Yellow" } else { "Green" }
                 Write-Host ("    Температура    : {0} C" -f $rel.Temperature) -ForegroundColor $tColor
             }
-            if ($rel.Wear -ne $null) {
+            if ($null -ne $rel.Wear) {
                 $wColor = if ($rel.Wear -gt 80) { "Red" } elseif ($rel.Wear -gt 50) { "Yellow" } else { "Green" }
                 Write-Host ("    Износ SSD      : {0}%" -f $rel.Wear) -ForegroundColor $wColor
             }
-            if ($rel.PowerOnHours -ne $null) {
+            if ($null -ne $rel.PowerOnHours) {
                 Write-Host ("    Часов работы   : {0} ч (~{1} дней)" -f $rel.PowerOnHours, [math]::Round($rel.PowerOnHours/24,0))
             }
         } catch {
@@ -870,40 +1371,48 @@ function Menu-Health {
     Write-Host "  --- ТЕМПЕРАТУРА ---" -ForegroundColor Cyan
     $tempFound = $false
     try {
-        $temps = Get-WmiObject -Namespace "root/wmi" -Class MSAcpi_ThermalZoneTemperature -ErrorAction Stop
+        $temps = Get-WinToolsCimInstance -Namespace "root/wmi" -Class MSAcpi_ThermalZoneTemperature -ErrorAction Stop
         foreach ($t in $temps) {
             $celsius = [math]::Round(($t.CurrentTemperature / 10) - 273.15, 1)
             $color = if ($celsius -gt 85) { "Red" } elseif ($celsius -gt 70) { "Yellow" } else { "Green" }
             Write-Host ("  Термозона: {0} C" -f $celsius) -ForegroundColor $color
             $tempFound = $true
         }
-    } catch { }
+    } catch {
+        $tempFound = $false
+    }
     if (-not $tempFound) {
         Write-INFO "Встроенные датчики не сообщили температуру (частое дело на ноутбуках)"
     }
-    $cpuLoad = (Get-WmiObject Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
+    $cpuLoad = (Get-WinToolsCimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
     Write-Host ("  Текущая загрузка ЦП: {0}%" -f $cpuLoad) -ForegroundColor White
     Write-Host ""
 
     Write-Host "  --- ПРОВЕРКА ОБНОВЛЕНИЙ ДРАЙВЕРОВ ---" -ForegroundColor Cyan
     $wu = Get-Service -Name wuauserv -ErrorAction SilentlyContinue
-    if ($wu -and $wu.StartType -eq "Disabled") {
-        Set-Service -Name wuauserv -StartupType Manual -ErrorAction SilentlyContinue
-        Write-INFO "Служба Windows Update временно включена для проверки"
-    }
-    Start-Service -Name wuauserv -ErrorAction SilentlyContinue
     try {
-        UsoClient StartScan 2>$null
+        if (-not $wu) { throw "служба Windows Update не найдена" }
+        if ($wu.StartType -eq "Disabled") {
+            Set-Service -Name wuauserv -StartupType Manual -ErrorAction Stop
+            Write-ActionLog -type "Service" -target "wuauserv" -oldValue "Disabled|Stopped" -desc "Windows Update для проверки драйверов"
+            Write-INFO "Служба Windows Update включена для проверки"
+        }
+        Start-Service -Name wuauserv -ErrorAction Stop
+        & UsoClient StartScan 2>$null
+        if ($LASTEXITCODE -ne 0) { throw "UsoClient завершился с кодом $LASTEXITCODE" }
         Write-OK "Проверка драйверов запущена через Windows Update"
         Write-Host "  Смотри: Параметры -> Центр обновления -> Дополнительные параметры -> Необязательные обновления" -ForegroundColor White
     } catch {
+        Write-FAIL "Не удалось запустить проверку: $($_.Exception.Message)"
         Write-INFO "Проверь вручную в Параметры -> Центр обновления Windows"
     }
     Write-Host ""
 
     Write-Host "  --- ПРОВЕРКА ШРИФТОВ ---" -ForegroundColor Cyan
-    $winInstallDate = (Get-WmiObject Win32_OperatingSystem).InstallDate
-    $winInstallDate = [Management.ManagementDateTimeConverter]::ToDateTime($winInstallDate)
+    $winInstallDate = (Get-WinToolsCimInstance Win32_OperatingSystem).InstallDate
+    if ($winInstallDate -isnot [datetime]) {
+        $winInstallDate = [Management.ManagementDateTimeConverter]::ToDateTime($winInstallDate)
+    }
     $fontPath = "C:\Windows\Fonts"
     $allFonts = Get-ChildItem $fontPath -File -ErrorAction SilentlyContinue
     $suspects = $allFonts | Where-Object { $_.CreationTime -gt $winInstallDate.AddDays(2) }
@@ -950,21 +1459,21 @@ function Menu-DriverUpdate {
     Write-Host "  Определяю комплектующие компьютера..." -ForegroundColor DarkGray
     Write-Host ""
 
-    $cpu = Get-WmiObject Win32_Processor | Select-Object -First 1
+    $cpu = Get-WinToolsCimInstance Win32_Processor | Select-Object -First 1
     Write-Host ("  Процессор : {0}" -f $cpu.Name) -ForegroundColor White
 
-    $gpus = Get-WmiObject Win32_VideoController | Where-Object { $_.Name -notmatch "Basic|Remote" }
+    $gpus = Get-WinToolsCimInstance Win32_VideoController | Where-Object { $_.Name -notmatch "Basic|Remote" }
     foreach ($g in $gpus) {
         Write-Host ("  Видео     : {0}" -f $g.Name) -ForegroundColor White
     }
 
-    $wifi = Get-WmiObject Win32_NetworkAdapter | Where-Object { $_.Name -match "Wireless|Wi-Fi|WiFi" -and $_.Manufacturer -notmatch "Microsoft" } | Select-Object -First 1
+    $wifi = Get-WinToolsCimInstance Win32_NetworkAdapter | Where-Object { $_.Name -match "Wireless|Wi-Fi|WiFi" -and $_.Manufacturer -notmatch "Microsoft" } | Select-Object -First 1
     if ($wifi) { Write-Host ("  Wi-Fi     : {0}" -f $wifi.Name) -ForegroundColor White }
 
-    $audio = Get-WmiObject Win32_SoundDevice | Select-Object -First 1
+    $audio = Get-WinToolsCimInstance Win32_SoundDevice | Select-Object -First 1
     if ($audio) { Write-Host ("  Аудио     : {0}" -f $audio.Name) -ForegroundColor White }
 
-    $sys = Get-WmiObject Win32_ComputerSystem
+    $sys = Get-WinToolsCimInstance Win32_ComputerSystem
     Write-Host ("  Ноутбук   : {0} {1}" -f $sys.Manufacturer, $sys.Model) -ForegroundColor White
     Write-Host ("  ОС        : {0}" -f $Script:WinVerName) -ForegroundColor DarkCyan
     Write-Host ""
@@ -1067,8 +1576,12 @@ function Menu-RestorePoint {
         }
     } elseif ($choice -eq "2") {
         Write-Host ""
-        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore" -Name "SystemRestorePointCreationFrequency" -Value 0 -Type DWord -ErrorAction SilentlyContinue
-        Write-OK "Лимит снят"
+        try {
+            New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore" -Name "SystemRestorePointCreationFrequency" -Value 0 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+            Write-OK "Лимит снят"
+        } catch {
+            Write-FAIL "Не удалось изменить лимит: $($_.Exception.Message)"
+        }
     } elseif ($choice -eq "3") {
         Write-Host ""
         Start-Process rstrui.exe
@@ -1126,9 +1639,13 @@ function Menu-ChangeLog {
 
     if ($choice -eq "0" -or [string]::IsNullOrWhiteSpace($choice)) { return }
     if ($choice -eq "C" -or $choice -eq "c") {
-        Remove-Item $Global:LogPath -Force -ErrorAction SilentlyContinue
-        "Timestamp,Type,Target,OldValue,Desc" | Out-File -FilePath $Global:LogPath -Encoding UTF8
-        Write-OK "Журнал очищен"
+        try {
+            Remove-Item $Global:LogPath -Force -ErrorAction Stop
+            "Timestamp,Type,Target,OldValue,Desc" | Out-File -FilePath $Global:LogPath -Encoding UTF8 -ErrorAction Stop
+            Write-OK "Журнал очищен"
+        } catch {
+            Write-FAIL "Не удалось очистить журнал: $($_.Exception.Message)"
+        }
         Pause-Menu; return
     }
 
@@ -1149,36 +1666,76 @@ function Menu-ChangeLog {
                 try {
                     if ($e.OldValue -eq "NULL") { Write-SKIP "Пропуск: неизвестное состояние для $($e.Target)" }
                     else {
-                        Set-Service -Name $e.Target -StartupType $e.OldValue -ErrorAction SilentlyContinue
-                        if ($e.OldValue -ne "Disabled") { Start-Service -Name $e.Target -ErrorAction SilentlyContinue }
-                        Write-OK "Служба $($e.Target) возвращена: $($e.OldValue)"
+                        $oldParts = $e.OldValue -split "\|", 2
+                        $oldStartType = $oldParts[0]
+                        $oldStatus = if ($oldParts.Count -gt 1) { $oldParts[1] } else { "Running" }
+                        Set-Service -Name $e.Target -StartupType $oldStartType -ErrorAction Stop
+                        if ($oldStatus -eq "Running") {
+                            Start-Service -Name $e.Target -ErrorAction Stop
+                        } else {
+                            Stop-Service -Name $e.Target -Force -ErrorAction Stop
+                        }
+                        $restored = Get-Service -Name $e.Target -ErrorAction Stop
+                        if ("$($restored.StartType)" -ne "$oldStartType") { throw "тип запуска не восстановлен" }
+                        Write-OK "Служба $($e.Target) возвращена: $oldStartType / $oldStatus"
                     }
-                } catch { Write-INFO "Не удалось отменить: $($e.Target)" }
+                } catch { Write-FAIL "Не удалось отменить службу $($e.Target): $($_.Exception.Message)" }
             }
             "Task" {
                 try {
-                    $parts2 = $e.Target -split "\|"
+                    $parts2 = $e.Target -split "\|", 2
                     $taskPath = $parts2[0]; $taskName = $parts2[1]
-                    if ($e.OldValue -ne "Disabled") {
-                        Enable-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction SilentlyContinue | Out-Null
-                        Write-OK "Задача $taskName включена обратно"
+                    if ($e.OldValue -eq "Disabled") {
+                        Disable-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction Stop | Out-Null
+                    } else {
+                        Enable-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction Stop | Out-Null
                     }
-                } catch { Write-INFO "Не удалось отменить задачу: $($e.Target)" }
+                    $task = Get-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction Stop
+                    if ($e.OldValue -eq "Disabled" -and $task.State -ne "Disabled") { throw "задача не была отключена обратно" }
+                    if ($e.OldValue -ne "Disabled" -and $task.State -eq "Disabled") { throw "задача не была включена обратно" }
+                    Write-OK "Состояние задачи возвращено: $taskName → $($e.OldValue)"
+                } catch { Write-FAIL "Не удалось отменить задачу $($e.Target): $($_.Exception.Message)" }
             }
             "Registry" {
                 try {
-                    $parts2 = $e.Target -split "\|"
+                    $parts2 = $e.Target -split "\|", 2
                     $regPath = $parts2[0]; $regName = $parts2[1]
                     if ($e.OldValue -eq "NULL") {
-                        Remove-ItemProperty -Path $regPath -Name $regName -ErrorAction SilentlyContinue
+                        Remove-ItemProperty -Path $regPath -Name $regName -ErrorAction Stop
+                        $stillExists = $true
+                        try { $null = Get-ItemPropertyValue -Path $regPath -Name $regName -ErrorAction Stop } catch { $stillExists = $false }
+                        if ($stillExists) { throw "параметр всё ещё существует" }
                         Write-OK "Параметр реестра удалён: $regName"
                     } else {
-                        Set-ItemProperty -Path $regPath -Name $regName -Value $e.OldValue -ErrorAction SilentlyContinue
+                        Set-ItemProperty -Path $regPath -Name $regName -Value $e.OldValue -ErrorAction Stop
+                        $actual = Get-ItemPropertyValue -Path $regPath -Name $regName -ErrorAction Stop
+                        if ("$actual" -ne "$($e.OldValue)") { throw "старое значение не восстановлено" }
                         Write-OK "Реестр $regName возвращён: $($e.OldValue)"
                     }
-                } catch { Write-INFO "Не удалось отменить реестр: $($e.Target)" }
+                } catch { Write-FAIL "Не удалось отменить реестр $($e.Target): $($_.Exception.Message)" }
             }
-            "Startup" { Write-INFO "Автозапуск $($e.Target) - добавь вручную если нужно" }
+            "StartupToggle" {
+                try {
+                    $parts2 = $e.Target -split "\|", 3
+                    $originalPath = $parts2[0]; $currentPath = $parts2[1]; $regName = $parts2[2]
+                    $value = Get-ItemPropertyValue -Path $currentPath -Name $regName -ErrorAction Stop
+                    $valueType = (Get-Item $currentPath -ErrorAction Stop).GetValueKind($regName).ToString()
+                    if (-not (Test-Path $originalPath)) { New-Item -Path $originalPath -Force -ErrorAction Stop | Out-Null }
+                    New-ItemProperty -Path $originalPath -Name $regName -Value $value -PropertyType $valueType -Force -ErrorAction Stop | Out-Null
+                    Remove-ItemProperty -Path $currentPath -Name $regName -ErrorAction Stop
+                    Write-OK "Состояние автозапуска возвращено: $regName"
+                } catch { Write-FAIL "Не удалось отменить переключение $($e.Target): $($_.Exception.Message)" }
+            }
+            "Startup" {
+                try {
+                    $parts2 = $e.Target -split "\|", 2
+                    $regPath = $parts2[0]; $regName = $parts2[1]
+                    if ($e.OldValue -eq "NULL") { throw "в журнале нет старого значения" }
+                    if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force -ErrorAction Stop | Out-Null }
+                    New-ItemProperty -Path $regPath -Name $regName -Value $e.OldValue -PropertyType String -Force -ErrorAction Stop | Out-Null
+                    Write-OK "Автозапуск возвращён: $regName"
+                } catch { Write-FAIL "Не удалось вернуть автозапуск $($e.Target): $($_.Exception.Message)" }
+            }
             default { Write-INFO "Нельзя отменить автоматически: $($e.Type) - $($e.Desc)" }
         }
     }
@@ -1281,11 +1838,24 @@ function Menu-Bloatware {
 
     Write-Host ""
     foreach ($appName in $toRemove) {
-        $pkg = Get-AppxPackage -Name $appName -AllUsers -ErrorAction SilentlyContinue
-        if ($pkg) {
-            Write-ActionLog -type "AppxPackage" -target $appName -oldValue "installed" -desc $appName
-            Remove-AppxPackage -Package $pkg.PackageFullName -AllUsers -ErrorAction SilentlyContinue
-            Write-OK "Удалено: $appName"
+        $packages = @(Get-AppxPackage -Name $appName -AllUsers -ErrorAction SilentlyContinue)
+        if ($packages.Count -gt 0) {
+            $removeErrors = @()
+            foreach ($package in $packages) {
+                try {
+                    Remove-AppxPackage -Package $package.PackageFullName -AllUsers -ErrorAction Stop
+                } catch {
+                    $removeErrors += $_
+                }
+            }
+            $remaining = @(Get-AppxPackage -Name $appName -AllUsers -ErrorAction SilentlyContinue)
+            if ($remaining.Count -eq 0) {
+                Write-ActionLog -type "AppxPackage" -target $appName -oldValue "installed" -desc $appName
+                Write-OK "Удалено: $appName"
+            } else {
+                $detail = if ($removeErrors.Count) { $removeErrors[0].Exception.Message } else { "пакет всё ещё установлен" }
+                Write-FAIL "Не удалось удалить ${appName}: $detail"
+            }
         } else {
             Write-SKIP "Не установлено: $appName"
         }
@@ -1298,19 +1868,41 @@ function Menu-Bloatware {
 # ============================================================
 function Menu-BrowserCache {
     Draw-Header "ОЧИСТКА КЭША БРАУЗЕРОВ - Brave, Chrome, Edge"
-    Write-Host "  Закроет браузеры и очистит кэш. Пароли и закладки не трогает." -ForegroundColor DarkGray
+    Write-Host "  Закроет выбранные браузеры и очистит кэш всех профилей." -ForegroundColor DarkGray
+    Write-Host "  Пароли, историю и закладки не трогает." -ForegroundColor DarkGray
     Write-Host ""
 
     $browsers = @(
-        @{Name="Brave";  Process="brave";  Path="$env:USERPROFILE\AppData\Local\BraveSoftware\Brave-Browser\User Data\Default\Cache"},
-        @{Name="Chrome"; Process="chrome"; Path="$env:USERPROFILE\AppData\Local\Google\Chrome\User Data\Default\Cache"},
-        @{Name="Edge";   Process="msedge"; Path="$env:USERPROFILE\AppData\Local\Microsoft\Edge\User Data\Default\Cache"}
+        @{Name="Brave";  Process="brave";  Root="$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data"},
+        @{Name="Chrome"; Process="chrome"; Root="$env:LOCALAPPDATA\Google\Chrome\User Data"},
+        @{Name="Edge";   Process="msedge"; Path="$env:LOCALAPPDATA\Microsoft\Edge\User Data"}
     )
+    # Keep one property name for all entries (the old Edge entry used Path by mistake in some forks).
+    $browsers[2].Root = $browsers[2].Path
+
+    function Get-BrowserCachePaths($browser) {
+        if (-not (Test-Path $browser.Root)) { return @() }
+        $profiles = Get-ChildItem $browser.Root -Directory -Force -ErrorAction SilentlyContinue | Where-Object {
+            $_.Name -eq "Default" -or $_.Name -like "Profile *" -or $_.Name -eq "Guest Profile"
+        }
+        $result = @()
+        foreach ($browserProfile in $profiles) {
+            foreach ($relative in @("Cache", "Code Cache", "GPUCache", "Service Worker\CacheStorage")) {
+                $candidate = Join-Path $browserProfile.FullName $relative
+                if (Test-Path $candidate) { $result += $candidate }
+            }
+        }
+        return $result | Select-Object -Unique
+    }
 
     $i = 1
     foreach ($b in $browsers) {
-        $size = Get-FolderSize $b.Path
-        $sizeStr = if ($size -gt 0) { "$size ГБ" } else { "не найдено или пусто" }
+        $paths = @(Get-BrowserCachePaths $b)
+        $bytes = ($paths | ForEach-Object {
+            (Get-ChildItem $_ -File -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+        } | Measure-Object -Sum).Sum
+        $size = if ($bytes) { [math]::Round($bytes / 1GB, 2) } else { 0 }
+        $sizeStr = if ($paths.Count -eq 0) { "не найден" } elseif ($size -gt 0) { "$size ГБ" } else { "< 0.01 ГБ" }
         Write-Host ("  [{0}] {1,-10} {2}" -f $i, $b.Name, $sizeStr) -ForegroundColor White
         $i++
     }
@@ -1325,19 +1917,31 @@ function Menu-BrowserCache {
     Write-Host "  Выбор: " -ForegroundColor White -NoNewline
     $choice = Read-Host
 
+    if ($choice -eq "0" -or [string]::IsNullOrWhiteSpace($choice)) { return }
     $selected = @()
     if ($choice -eq "A" -or $choice -eq "a") { $selected = $browsers }
     elseif ($choice -match "^\d+$" -and [int]$choice -ge 1 -and [int]$choice -le $browsers.Count) { $selected = @($browsers[[int]$choice - 1]) }
+    else { Write-FAIL "Неверный выбор"; Pause-Menu; return }
 
     Write-Host ""
     foreach ($b in $selected) {
         Stop-Process -Name $b.Process -Force -ErrorAction SilentlyContinue
         Start-Sleep -Milliseconds 500
-        if (Test-Path $b.Path) {
-            Remove-Item "$($b.Path)\*" -Recurse -Force -ErrorAction SilentlyContinue
-            Write-OK "Кэш $($b.Name) очищен"
+        $paths = @(Get-BrowserCachePaths $b)
+        if ($paths.Count -eq 0) {
+            Write-SKIP "$($b.Name): кэш не найден"
+            continue
+        }
+
+        $removeErrors = @()
+        foreach ($path in $paths) {
+            Get-ChildItem $path -Force -ErrorAction SilentlyContinue |
+                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -ErrorVariable +removeErrors
+        }
+        if ($removeErrors.Count -gt 0) {
+            Write-INFO "Кэш $($b.Name) очищен частично; занятых файлов: $($removeErrors.Count)"
         } else {
-            Write-SKIP "$($b.Name) не найден"
+            Write-OK "Кэш всех профилей $($b.Name) очищен"
         }
     }
     Pause-Menu
@@ -1349,14 +1953,14 @@ function Menu-BrowserCache {
 function Menu-Cosmetics {
     Draw-Header "КОСМЕТИКА WINDOWS"
 
-    $classicMenuPath = "HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32"
+    $classicMenuRoot = "HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}"
+    $classicMenuPath = "$classicMenuRoot\InprocServer32"
     $classicEnabled = Test-Path $classicMenuPath
 
     $advPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
     $hideExt = (Get-ItemProperty $advPath -ErrorAction SilentlyContinue).HideFileExt
     $hideHidden = (Get-ItemProperty $advPath -ErrorAction SilentlyContinue).Hidden
 
-    # Win11 only: classic context menu
     if ($Script:IsWin11) {
         Write-Host ("  [1] Классическое контекстное меню (ПКМ)   статус: {0}" -f $(if($classicEnabled){"ВКЛ"}else{"выкл (Win11 по умолч.)"})) -ForegroundColor $(if($classicEnabled){"Green"}else{"White"})
     } else {
@@ -1366,9 +1970,7 @@ function Menu-Cosmetics {
     Write-Host ("  [3] Показ скрытых файлов и папок           статус: {0}" -f $(if($hideHidden -eq 1){"ВКЛ"}else{"выкл"})) -ForegroundColor $(if($hideHidden -eq 1){"Green"}else{"White"})
     Write-Host ""
     Write-Host "  +----------------------------------------------------------------+" -ForegroundColor DarkGray
-    if ($Script:IsWin11) {
-        Write-Host "  | [1] Переключить классическое меню ПКМ                          |" -ForegroundColor White
-    }
+    if ($Script:IsWin11) { Write-Host "  | [1] Переключить классическое меню ПКМ                          |" -ForegroundColor White }
     Write-Host "  | [2] Переключить показ расширений файлов                        |" -ForegroundColor White
     Write-Host "  | [3] Переключить показ скрытых файлов                           |" -ForegroundColor White
     Write-Host "  | [A] Включить ВСЕ доступное                                     |" -ForegroundColor Cyan
@@ -1378,51 +1980,598 @@ function Menu-Cosmetics {
     Write-Host "  Выбор: " -ForegroundColor White -NoNewline
     $choice = Read-Host
 
+    function Restart-ExplorerShell {
+        Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 500
+        Start-Process explorer.exe -ErrorAction Stop
+    }
+
     function Toggle-ClassicMenu {
-        if ($Script:IsWin11) {
+        if (-not $Script:IsWin11) { Write-SKIP "Доступно только на Windows 11"; return }
+        try {
             if ($classicEnabled) {
-                Remove-Item -Path "HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}" -Recurse -Force -ErrorAction SilentlyContinue
+                Remove-Item -Path $classicMenuRoot -Recurse -Force -ErrorAction Stop
+                if (Test-Path $classicMenuRoot) { throw "раздел реестра не удалён" }
                 Write-OK "Классическое меню выключено"
             } else {
-                New-Item -Path $classicMenuPath -Force | Out-Null
-                Set-ItemProperty -Path $classicMenuPath -Name "(default)" -Value "" -ErrorAction SilentlyContinue
+                Set-RegLogged $classicMenuPath "(default)" "" "String" "Classic Context Menu"
+                if (-not (Test-Path $classicMenuPath)) { throw "раздел реестра не создан" }
                 Write-OK "Классическое контекстное меню включено"
             }
-            Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Milliseconds 500
-            Start-Process explorer
-        } else {
-            Write-SKIP "Доступно только на Windows 11"
+            Restart-ExplorerShell
+        } catch {
+            Write-FAIL "Не удалось переключить контекстное меню: $($_.Exception.Message)"
         }
     }
 
     function Toggle-FileExt {
         $new = if ($hideExt -eq 0) { 1 } else { 0 }
-        Set-RegLogged $advPath "HideFileExt" $new "DWord" "Показ расширений"
-        Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Milliseconds 500
-        Start-Process explorer
-        if ($new -eq 0) { Write-OK "Расширения файлов показываются" } else { Write-OK "Расширения скрыты" }
+        try {
+            Set-RegLogged $advPath "HideFileExt" $new "DWord" "Показ расширений"
+            Restart-ExplorerShell
+            if ($new -eq 0) { Write-OK "Расширения файлов показываются" } else { Write-OK "Расширения скрыты" }
+        } catch {
+            Write-FAIL "Не удалось изменить показ расширений: $($_.Exception.Message)"
+        }
     }
 
     function Toggle-HiddenFiles {
         $new = if ($hideHidden -eq 1) { 2 } else { 1 }
-        Set-RegLogged $advPath "Hidden" $new "DWord" "Скрытые файлы"
-        Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Milliseconds 500
-        Start-Process explorer
-        if ($new -eq 1) { Write-OK "Скрытые файлы показываются" } else { Write-OK "Скрытые файлы скрыты" }
+        try {
+            Set-RegLogged $advPath "Hidden" $new "DWord" "Скрытые файлы"
+            Restart-ExplorerShell
+            if ($new -eq 1) { Write-OK "Скрытые файлы показываются" } else { Write-OK "Скрытые файлы скрыты" }
+        } catch {
+            Write-FAIL "Не удалось изменить показ скрытых файлов: $($_.Exception.Message)"
+        }
     }
 
     Write-Host ""
     switch ($choice) {
+        "0" { return }
         "1" { Toggle-ClassicMenu }
         "2" { Toggle-FileExt }
         "3" { Toggle-HiddenFiles }
         "A" { if ($Script:IsWin11 -and -not $classicEnabled) { Toggle-ClassicMenu }; if ($hideExt -ne 0) { Toggle-FileExt }; if ($hideHidden -ne 1) { Toggle-HiddenFiles } }
         "a" { if ($Script:IsWin11 -and -not $classicEnabled) { Toggle-ClassicMenu }; if ($hideExt -ne 0) { Toggle-FileExt }; if ($hideHidden -ne 1) { Toggle-HiddenFiles } }
+        default { Write-FAIL "Неверный выбор" }
     }
     Pause-Menu
+}
+
+# ============================================================
+# SNAPSHOTS / EXPORT / IMPORT
+# ============================================================
+function Get-WinToolsRegistryTargets {
+    $targets = @(
+        @{P="HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers"; N="HwSchMode"},
+        @{P="HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling"; N="PowerThrottlingOff"},
+        @{P="HKCU:\System\GameConfigStore"; N="GameDVR_Enabled"},
+        @{P="HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR"; N="AppCaptureEnabled"},
+        @{P="HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects"; N="VisualFXSetting"},
+        @{P="HKCU:\Control Panel\Desktop"; N="MinAnimate"},
+        @{P="HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"; N="TaskbarAnimations"},
+        @{P="HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power"; N="HiberbootEnabled"},
+        @{P="HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo"; N="Enabled"},
+        @{P="HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection"; N="AllowTelemetry"},
+        @{P="HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection"; N="DoNotShowFeedbackNotifications"},
+        @{P="HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive"; N="DisableFileSyncNGSC"},
+        @{P="HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"; N="RotatingLockScreenEnabled"},
+        @{P="HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"; N="ContentDeliveryAllowed"},
+        @{P="HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"; N="SubscribedContent-338387Enabled"},
+        @{P="HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"; N="SubscribedContent-338388Enabled"},
+        @{P="HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"; N="SubscribedContent-338389Enabled"},
+        @{P="HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"; N="SilentInstalledAppsEnabled"},
+        @{P="HKLM:\SYSTEM\CurrentControlSet\Control"; N="WaitToKillServiceTimeout"},
+        @{P="HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer"; N="NoDriveTypeAutoRun"},
+        @{P="HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization"; N="DODownloadMode"},
+        @{P="HKCU:\Software\Microsoft\InputPersonalization"; N="RestrictImplicitInkCollection"},
+        @{P="HKCU:\Software\Microsoft\InputPersonalization"; N="RestrictImplicitTextCollection"},
+        @{P="HKCU:\Software\Microsoft\GameBar"; N="AllowAutoGameMode"},
+        @{P="HKCU:\Software\Microsoft\GameBar"; N="AutoGameModeEnabled"},
+        @{P="HKCU:\Control Panel\Mouse"; N="MouseSpeed"},
+        @{P="HKCU:\Control Panel\Mouse"; N="MouseThreshold1"},
+        @{P="HKCU:\Control Panel\Mouse"; N="MouseThreshold2"},
+        @{P="HKLM:\SOFTWARE\Policies\Microsoft\Dsh"; N="AllowNewsAndInterests"},
+        @{P="HKCU:\Software\Policies\Microsoft\Windows\Explorer"; N="DisableSearchBoxSuggestions"},
+        @{P="HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications"; N="GlobalUserDisabled"},
+        @{P="HKCU:\Software\Microsoft\Windows\CurrentVersion\PushNotifications"; N="ToastEnabled"},
+        @{P="HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"; N="ShowSecondsInSystemClock"},
+        @{P="HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"; N="HideFileExt"},
+        @{P="HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"; N="Hidden"},
+        @{P="HKLM:\SYSTEM\CurrentControlSet\Control\Power"; N="HibernateEnabled"},
+        @{P="HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32"; N="(default)"}
+    )
+    $ifaces = Get-ChildItem "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces" -ErrorAction SilentlyContinue
+    foreach ($iface in $ifaces) {
+        $targets += @{P=$iface.PSPath; N="TcpAckFrequency"}
+        $targets += @{P=$iface.PSPath; N="TCPNoDelay"}
+    }
+    return $targets
+}
+
+function Get-WinToolsStartupPaths {
+    return @(
+        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run",
+        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run\WinToolsDisabled",
+        "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run",
+        "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run\WinToolsDisabled",
+        "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run",
+        "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run\WinToolsDisabled"
+    )
+}
+
+function Export-WinToolsSnapshot([string]$reason="manual", [switch]$quiet) {
+    $folder = "$env:ProgramData\WinTools\Snapshots"
+    if (-not (Test-Path $folder)) { New-Item -Path $folder -ItemType Directory -Force -ErrorAction Stop | Out-Null }
+    $safeReason = $reason -replace '[^a-zA-Z0-9_-]', '_'
+    $file = Join-Path $folder ("WinTools_{0}_{1}.json" -f $safeReason, (Get-Date -Format "yyyyMMdd_HHmmss"))
+
+    $registry = @()
+    foreach ($target in Get-WinToolsRegistryTargets) {
+        $exists = $false; $value = $null; $valueType = "String"
+        try {
+            $value = Get-ItemPropertyValue -Path $target.P -Name $target.N -ErrorAction Stop
+            $exists = $true
+            $nativeName = if ($target.N -eq "(default)") { "" } else { $target.N }
+            $valueType = (Get-Item $target.P -ErrorAction Stop).GetValueKind($nativeName).ToString()
+        } catch { $exists = $false }
+        $registry += [pscustomobject]@{Path=$target.P; Name=$target.N; Exists=$exists; Value=$value; Type=$valueType}
+    }
+
+    $services = @(Get-Service -ErrorAction SilentlyContinue | ForEach-Object {
+        [pscustomobject]@{Name=$_.Name; StartType="$($_.StartType)"; Status="$($_.Status)"}
+    })
+    $tasks = @()
+    if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
+        $tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue | ForEach-Object {
+            [pscustomobject]@{Path=$_.TaskPath; Name=$_.TaskName; State="$($_.State)"}
+        })
+    }
+
+    $startup = @()
+    foreach ($path in Get-WinToolsStartupPaths) {
+        $item = Get-ItemProperty $path -ErrorAction SilentlyContinue
+        if (-not $item) { continue }
+        $item.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' } | ForEach-Object {
+            $type = "String"
+            try { $type = (Get-Item $path -ErrorAction Stop).GetValueKind($_.Name).ToString() } catch { $type = "String" }
+            $startup += [pscustomobject]@{Path=$path; Name=$_.Name; Value=$_.Value; Type=$type}
+        }
+    }
+
+    $activeText = (& powercfg /getactivescheme 2>$null) -join " "
+    $activeGuid = if ($activeText -match '(?i)[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}') { $matches[0] } else { $null }
+    $snapshot = [pscustomobject]@{
+        FormatVersion=1; WinToolsVersion=$Script:WinToolsVersion; Created=(Get-Date).ToString("o")
+        Reason=$reason; Computer=$env:COMPUTERNAME; User=$env:USERNAME; Windows=$Script:WinVerName
+        Registry=$registry; Services=$services; Tasks=$tasks; Startup=$startup; ActivePowerScheme=$activeGuid
+    }
+    $snapshot | ConvertTo-Json -Depth 8 | Set-Content -Path $file -Encoding UTF8 -ErrorAction Stop
+    if (-not $quiet) { Write-OK "Снимок создан: $file" }
+    return $file
+}
+
+function Import-WinToolsSnapshot($path) {
+    if (-not (Test-Path $path)) { Write-FAIL "Файл не найден: $path"; return $false }
+    try { $snapshot = Get-Content $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
+    catch { Write-FAIL "Не удалось прочитать снимок: $($_.Exception.Message)"; return $false }
+    if ([int]$snapshot.FormatVersion -ne 1) { Write-FAIL "Неподдерживаемый формат снимка: $($snapshot.FormatVersion)"; return $false }
+
+    $preview = @(
+        "Снимок: $($snapshot.Created)",
+        "Параметров реестра: $(@($snapshot.Registry).Count)",
+        "Служб: $(@($snapshot.Services).Count)",
+        "Задач: $(@($snapshot.Tasks).Count)",
+        "Записей автозапуска: $(@($snapshot.Startup).Count)",
+        "Записи автозапуска в реестре будут точно восстановлены по снимку"
+    )
+    if ($snapshot.Computer -and $snapshot.Computer -ne $env:COMPUTERNAME) {
+        $preview += "ВНИМАНИЕ: снимок другого компьютера: $($snapshot.Computer)"
+    }
+    if ($snapshot.User -and $snapshot.User -ne $env:USERNAME) {
+        $preview += "ВНИМАНИЕ: снимок другого пользователя: $($snapshot.User)"
+    }
+    if (-not (Confirm-ActionPreview $preview)) { return $false }
+
+    $preBackup = Export-WinToolsSnapshot -reason "before_import" -quiet
+    Write-INFO "Снимок перед импортом: $preBackup"
+    $ok=0; $failed=0
+    $allowedRegistry = @{}
+    foreach ($target in Get-WinToolsRegistryTargets) {
+        $allowedRegistry[("{0}|{1}" -f $target.P,$target.N).ToLowerInvariant()] = $true
+    }
+    $allowedTypes = @("String", "ExpandString", "Binary", "DWord", "MultiString", "QWord", "Unknown")
+    foreach ($entry in @($snapshot.Registry)) {
+        $registryId = ("{0}|{1}" -f $entry.Path,$entry.Name).ToLowerInvariant()
+        if (-not $allowedRegistry.ContainsKey($registryId) -or $allowedTypes -notcontains "$($entry.Type)") { $failed++; continue }
+        try {
+            if ([bool]$entry.Exists) {
+                if (-not (Test-Path $entry.Path)) { New-Item -Path $entry.Path -Force -ErrorAction Stop | Out-Null }
+                New-ItemProperty -Path $entry.Path -Name $entry.Name -Value $entry.Value -PropertyType $entry.Type -Force -ErrorAction Stop | Out-Null
+            } else {
+                $classicRoot = "HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}"
+                if ($entry.Name -eq "(default)" -and "$($entry.Path)" -like "$classicRoot*") {
+                    Remove-Item $classicRoot -Recurse -Force -ErrorAction SilentlyContinue
+                } else {
+                    Remove-ItemProperty -Path $entry.Path -Name $entry.Name -ErrorAction SilentlyContinue
+                }
+            }
+            $ok++
+        } catch { $failed++ }
+    }
+    foreach ($entry in @($snapshot.Services)) {
+        try {
+            $service = Get-Service -Name $entry.Name -ErrorAction Stop
+            if ("$($service.StartType)" -ne "$($entry.StartType)") { Set-Service -Name $entry.Name -StartupType $entry.StartType -ErrorAction Stop }
+            if ($entry.Status -eq "Running") { Start-Service -Name $entry.Name -ErrorAction Stop }
+            elseif ($service.Status -ne "Stopped") { Stop-Service -Name $entry.Name -Force -ErrorAction Stop }
+            $ok++
+        } catch { $failed++ }
+    }
+    foreach ($entry in @($snapshot.Tasks)) {
+        try {
+            if ($entry.State -eq "Disabled") { Disable-ScheduledTask -TaskPath $entry.Path -TaskName $entry.Name -ErrorAction Stop | Out-Null }
+            else { Enable-ScheduledTask -TaskPath $entry.Path -TaskName $entry.Name -ErrorAction Stop | Out-Null }
+            $ok++
+        } catch { $failed++ }
+    }
+    $startupPaths = @(Get-WinToolsStartupPaths)
+    foreach ($startupPath in $startupPaths) {
+        $current = Get-ItemProperty $startupPath -ErrorAction SilentlyContinue
+        if ($current) {
+            foreach ($property in @($current.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' })) {
+                try { Remove-ItemProperty -Path $startupPath -Name $property.Name -ErrorAction Stop; $ok++ } catch { $failed++ }
+            }
+        }
+    }
+    foreach ($entry in @($snapshot.Startup)) {
+        try {
+            if ($startupPaths -notcontains "$($entry.Path)" -or $allowedTypes -notcontains "$($entry.Type)") { throw "Unsafe startup snapshot entry" }
+            if (-not (Test-Path $entry.Path)) { New-Item -Path $entry.Path -Force -ErrorAction Stop | Out-Null }
+            New-ItemProperty -Path $entry.Path -Name $entry.Name -Value $entry.Value -PropertyType $entry.Type -Force -ErrorAction Stop | Out-Null
+            $ok++
+        } catch { $failed++ }
+    }
+    if ($snapshot.ActivePowerScheme) {
+        & powercfg /setactive $snapshot.ActivePowerScheme 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) { $ok++ } else { $failed++ }
+    }
+    if ($failed -eq 0) { Write-OK "Снимок восстановлен. Успешных операций: $ok"; return $true }
+    Write-FAIL "Импорт завершён частично: успешно $ok, ошибок $failed"
+    return $false
+}
+# ============================================================
+# MENU 16 - SYSTEM PROFILES
+# ============================================================
+function Menu-Profiles {
+    Draw-Header "СИСТЕМНЫЕ ПРОФИЛИ - безопасные наборы настроек"
+    $hasBattery = $null -ne (Get-WinToolsCimInstance Win32_Battery -ErrorAction SilentlyContinue | Select-Object -First 1)
+    $recommended = if ($hasBattery) { 2 } else { 1 }
+    $profiles = @(
+        @{N=1; Name="Игровой ПК"; Desc="Максимум производительности для настольного ПК"; Power="SCHEME_MIN"; Values=@(
+            @("HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers","HwSchMode",2,"DWord","GPU Scheduling"),
+            @("HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling","PowerThrottlingOff",1,"DWord","Power Throttling"),
+            @("HKCU:\System\GameConfigStore","GameDVR_Enabled",0,"DWord","Game DVR"),
+            @("HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR","AppCaptureEnabled",0,"DWord","App Capture"),
+            @("HKCU:\Software\Microsoft\GameBar","AllowAutoGameMode",1,"DWord","Game Mode"),
+            @("HKCU:\Software\Microsoft\GameBar","AutoGameModeEnabled",1,"DWord","Game Mode")
+        )},
+        @{N=2; Name="Игровой ноутбук"; Desc="Игровые настройки без отключения энергосбережения"; Power="SCHEME_BALANCED"; Values=@(
+            @("HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers","HwSchMode",2,"DWord","GPU Scheduling"),
+            @("HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling","PowerThrottlingOff",0,"DWord","Power Throttling"),
+            @("HKCU:\System\GameConfigStore","GameDVR_Enabled",0,"DWord","Game DVR"),
+            @("HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR","AppCaptureEnabled",0,"DWord","App Capture"),
+            @("HKCU:\Software\Microsoft\GameBar","AllowAutoGameMode",1,"DWord","Game Mode"),
+            @("HKCU:\Software\Microsoft\GameBar","AutoGameModeEnabled",1,"DWord","Game Mode")
+        )},
+        @{N=3; Name="Сбалансированный"; Desc="Стандартное питание и минимум спорных изменений"; Power="SCHEME_BALANCED"; Values=@(
+            @("HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers","HwSchMode",1,"DWord","GPU Scheduling"),
+            @("HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling","PowerThrottlingOff",0,"DWord","Power Throttling"),
+            @("HKCU:\System\GameConfigStore","GameDVR_Enabled",1,"DWord","Game DVR"),
+            @("HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR","AppCaptureEnabled",1,"DWord","App Capture"),
+            @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects","VisualFXSetting",0,"DWord","Visual FX"),
+            @("HKCU:\Control Panel\Desktop","MinAnimate","1","String","MinAnimate"),
+            @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced","TaskbarAnimations",1,"DWord","Taskbar Animations"),
+            @("HKCU:\Software\Microsoft\GameBar","AllowAutoGameMode",0,"DWord","Game Mode"),
+            @("HKCU:\Software\Microsoft\GameBar","AutoGameModeEnabled",0,"DWord","Game Mode")
+        )},
+        @{N=4; Name="Приватность"; Desc="Телеметрия, реклама, советы, веб-поиск и виджеты"; Power=$null; Values=@(
+            @("HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo","Enabled",0,"DWord","Advertising ID"),
+            @("HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection","AllowTelemetry",0,"DWord","Telemetry"),
+            @("HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection","DoNotShowFeedbackNotifications",1,"DWord","Feedback"),
+            @("HKCU:\Software\Policies\Microsoft\Windows\Explorer","DisableSearchBoxSuggestions",1,"DWord","Web Search"),
+            @("HKLM:\SOFTWARE\Policies\Microsoft\Dsh","AllowNewsAndInterests",0,"DWord","Widgets"),
+            @("HKCU:\Software\Microsoft\InputPersonalization","RestrictImplicitInkCollection",1,"DWord","Ink Collection"),
+            @("HKCU:\Software\Microsoft\InputPersonalization","RestrictImplicitTextCollection",1,"DWord","Text Collection"),
+            @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager","RotatingLockScreenEnabled",0,"DWord","Windows Spotlight"),
+            @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager","ContentDeliveryAllowed",0,"DWord","Content Delivery"),
+            @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager","SubscribedContent-338387Enabled",0,"DWord","Windows Suggestions"),
+            @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager","SubscribedContent-338388Enabled",0,"DWord","Windows Suggestions"),
+            @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager","SubscribedContent-338389Enabled",0,"DWord","Windows Suggestions"),
+            @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager","SilentInstalledAppsEnabled",0,"DWord","Suggested Apps")
+        )},
+        @{N=5; Name="Стандарт Windows"; Desc="Вернуть стандартные значения управляемых профилями параметров"; Power="SCHEME_BALANCED"; Values=@(
+            @("HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers","HwSchMode",1,"DWord","GPU Scheduling"),
+            @("HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling","PowerThrottlingOff",0,"DWord","Power Throttling"),
+            @("HKCU:\System\GameConfigStore","GameDVR_Enabled",1,"DWord","Game DVR"),
+            @("HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR","AppCaptureEnabled",1,"DWord","App Capture"),
+            @("HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo","Enabled",1,"DWord","Advertising ID"),
+            @("HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection","AllowTelemetry",1,"DWord","Telemetry"),
+            @("HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection","DoNotShowFeedbackNotifications",0,"DWord","Feedback"),
+            @("HKCU:\Software\Policies\Microsoft\Windows\Explorer","DisableSearchBoxSuggestions",0,"DWord","Web Search"),
+            @("HKLM:\SOFTWARE\Policies\Microsoft\Dsh","AllowNewsAndInterests",1,"DWord","Widgets"),
+            @("HKCU:\Software\Microsoft\InputPersonalization","RestrictImplicitInkCollection",0,"DWord","Ink Collection"),
+            @("HKCU:\Software\Microsoft\InputPersonalization","RestrictImplicitTextCollection",0,"DWord","Text Collection"),
+            @("HKCU:\Software\Microsoft\GameBar","AllowAutoGameMode",0,"DWord","Game Mode"),
+            @("HKCU:\Software\Microsoft\GameBar","AutoGameModeEnabled",0,"DWord","Game Mode"),
+            @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects","VisualFXSetting",0,"DWord","Visual FX"),
+            @("HKCU:\Control Panel\Desktop","MinAnimate","1","String","MinAnimate"),
+            @("HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced","TaskbarAnimations",1,"DWord","Taskbar Animations"),
+            @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager","RotatingLockScreenEnabled",1,"DWord","Windows Spotlight"),
+            @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager","ContentDeliveryAllowed",1,"DWord","Content Delivery"),
+            @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager","SubscribedContent-338387Enabled",1,"DWord","Windows Suggestions"),
+            @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager","SubscribedContent-338388Enabled",1,"DWord","Windows Suggestions"),
+            @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager","SubscribedContent-338389Enabled",1,"DWord","Windows Suggestions"),
+            @("HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager","SilentInstalledAppsEnabled",1,"DWord","Suggested Apps")
+        )}
+    )
+    foreach ($selectedProfile in $profiles) {
+        $mark = if ($selectedProfile.N -eq $recommended) { " <<< РЕКОМЕНДУЕТСЯ ДЛЯ ЭТОГО УСТРОЙСТВА" } else { "" }
+        Write-Host ("  [{0}] {1,-20} {2}{3}" -f $selectedProfile.N,$selectedProfile.Name,$selectedProfile.Desc,$mark) -ForegroundColor $(if($mark){"Green"}else{"White"})
+    }
+    Write-Host "  [0] Назад" -ForegroundColor DarkGray
+    Write-Host "`n  Выбор: " -NoNewline
+    $choice=(Read-Host).Trim()
+    if($choice -eq "0"){return}
+    $selectedProfile=$profiles|Where-Object{"$($_.N)" -eq $choice}|Select-Object -First 1
+    if(-not $selectedProfile){Write-FAIL "Неверный профиль";Pause-Menu;return}
+    $preview=@("Профиль: $($selectedProfile.Name)") + @($selectedProfile.Values|ForEach-Object{"[РЕЕСТР] $($_[4]) → $($_[2])"})
+    if($selectedProfile.Power){$preview += "[ПИТАНИЕ] $($selectedProfile.Power)"}
+    if(-not(Confirm-ActionPreview $preview)){Menu-Profiles;return}
+    $backup=Export-WinToolsSnapshot -reason "before_profile_$($selectedProfile.N)" -quiet
+    Write-INFO "Резервный снимок: $backup"
+    $profileFailures = 0
+    foreach ($v in $selectedProfile.Values) {
+        try { Set-RegLogged $v[0] $v[1] $v[2] $v[3] $v[4] }
+        catch { $profileFailures++; Write-FAIL "$($v[4]): $($_.Exception.Message)" }
+    }
+    if ($selectedProfile.Power) {
+        & powercfg /setactive $selectedProfile.Power 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { $profileFailures++; Write-FAIL "Не удалось включить схему питания: код $LASTEXITCODE" }
+    }
+    if ($profileFailures -eq 0) { Write-OK "Профиль применён: $($selectedProfile.Name)" }
+    else { Write-FAIL "Профиль завершён с ошибками: $profileFailures. Используй резервный снимок для отката." }
+    Pause-Menu
+}
+# ============================================================
+# MENU 17 - EXPORT / IMPORT
+# ============================================================
+function Menu-Snapshots {
+    Draw-Header "ЭКСПОРТ / ИМПОРТ - снимки настроек"
+    $folder="$env:ProgramData\WinTools\Snapshots"
+    Write-Host "  [1] Создать полный снимок настроек" -ForegroundColor Green
+    Write-Host "  [2] Импортировать последний снимок" -ForegroundColor White
+    Write-Host "  [3] Импортировать файл по пути" -ForegroundColor White
+    Write-Host "  [4] Показать сохранённые снимки" -ForegroundColor White
+    Write-Host "  [0] Назад" -ForegroundColor DarkGray
+    Write-Host "`n  Выбор: " -NoNewline
+    $choice=(Read-Host).Trim()
+    switch($choice){
+        "1" { try{$path=Export-WinToolsSnapshot -reason "manual";Write-OK "Снимок сохранён: $path"}catch{Write-FAIL $_.Exception.Message} }
+        "2" { $last=Get-ChildItem $folder -Filter "*.json" -File -ErrorAction SilentlyContinue|Sort-Object LastWriteTime -Descending|Select-Object -First 1;if($last){if(-not(Import-WinToolsSnapshot $last.FullName)){Menu-Snapshots;return}}else{Write-INFO "Снимков нет"} }
+        "3" { Write-Host "  Путь: " -NoNewline;$path=Read-Host;if(-not(Import-WinToolsSnapshot $path)){Menu-Snapshots;return} }
+        "4" { Get-ChildItem $folder -Filter "*.json" -File -ErrorAction SilentlyContinue|Sort-Object LastWriteTime -Descending|ForEach-Object{Write-Host("  {0}  {1:N1} KB" -f $_.FullName,($_.Length/1KB))} }
+        "0" { return }
+    }
+    Pause-Menu
+}
+
+# ============================================================
+# MENU 18 - DIAGNOSTICS
+# ============================================================
+function Menu-Diagnostics {
+    Draw-Header "ДИАГНОСТИКА - полный отчёт без изменения системы"
+    Write-INFO "Собираю данные, это может занять несколько секунд..."
+    $lines = New-Object System.Collections.Generic.List[string]
+    $os=Get-WinToolsCimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+    $cs=Get-WinToolsCimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+    $cpu=Get-WinToolsCimInstance Win32_Processor -ErrorAction SilentlyContinue|Select-Object -First 1
+    $gpus=@(Get-WinToolsCimInstance Win32_VideoController -ErrorAction SilentlyContinue|Where-Object{$_.Name -notmatch 'Basic|Remote'})
+    $uptime=if($os.LastBootUpTime){[math]::Round(((Get-Date)-[datetime]$os.LastBootUpTime).TotalHours,1)}else{"?"}
+    $lines.Add("WINTOOLS DIAGNOSTIC REPORT")
+    $lines.Add("Создан: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+    $lines.Add("WinTools: $Script:WinToolsVersion")
+    $lines.Add("ОС: $($os.Caption), build $($os.BuildNumber), $($os.OSArchitecture)")
+    $lines.Add("Компьютер: $($cs.Manufacturer) $($cs.Model)")
+    $lines.Add("Процессор: $($cpu.Name)")
+    $lines.Add("ОЗУ: $([math]::Round($cs.TotalPhysicalMemory/1GB,1)) GB")
+    $lines.Add("Видеокарты: $(($gpus.Name) -join '; ')")
+    $lines.Add("Аптайм: $uptime ч")
+    $lines.Add("")
+    $lines.Add("--- ДИСКИ ---")
+    try { Get-PhysicalDisk -ErrorAction Stop|ForEach-Object{$lines.Add("$($_.FriendlyName): $($_.MediaType), Health=$($_.HealthStatus), Size=$([math]::Round($_.Size/1GB)) GB")} } catch {$lines.Add("Физические диски: данные недоступны")}
+    Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue|ForEach-Object{$lines.Add("$($_.Name): свободно $([math]::Round($_.Free/1GB,1)) / $([math]::Round(($_.Used+$_.Free)/1GB,1)) GB")}
+    $lines.Add("")
+    $lines.Add("--- БЕЗОПАСНОСТЬ И ОБНОВЛЕНИЯ ---")
+    $wu=Get-Service wuauserv -ErrorAction SilentlyContinue
+    $lines.Add("Windows Update: $($wu.Status), StartType=$($wu.StartType)")
+    if(Get-Command Get-MpComputerStatus -ErrorAction SilentlyContinue){try{$mp=Get-MpComputerStatus -ErrorAction Stop;$lines.Add("Defender: Antivirus=$($mp.AntivirusEnabled), RealTime=$($mp.RealTimeProtectionEnabled), Signatures=$($mp.AntivirusSignatureLastUpdated)")}catch{$lines.Add("Defender: данные недоступны")}}
+    $pending=(Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired") -or (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending")
+    $lines.Add("Ожидается перезагрузка: $pending")
+    $lines.Add("")
+    $lines.Add("--- УСТРОЙСТВА И ОШИБКИ ---")
+    if(Get-Command Get-PnpDevice -ErrorAction SilentlyContinue){$bad=@(Get-PnpDevice -ErrorAction SilentlyContinue|Where-Object{$_.Status -ne 'OK'});$lines.Add("Проблемных устройств: $($bad.Count)");$bad|Select-Object -First 20|ForEach-Object{$lines.Add("  $($_.Status): $($_.FriendlyName)")}}
+    try{$events=@(Get-WinEvent -FilterHashtable @{LogName='System';Level=1,2;StartTime=(Get-Date).AddHours(-24)} -MaxEvents 20 -ErrorAction Stop);$lines.Add("Критических/ошибочных событий за 24ч: $($events.Count)");$events|Select-Object -First 10|ForEach-Object{$lines.Add("  $($_.TimeCreated) [$($_.Id)] $($_.ProviderName): $(($_.Message -replace '[\r\n]+',' ') | Select-Object -First 1)")}}catch{$lines.Add("Системные события: не удалось прочитать")}
+    $disabled=@(Get-Service -ErrorAction SilentlyContinue|Where-Object{$_.StartType -eq 'Disabled'})
+    $lines.Add("Отключённых служб: $($disabled.Count)")
+    $folder="$env:ProgramData\WinTools\Reports";if(-not(Test-Path $folder)){New-Item $folder -ItemType Directory -Force|Out-Null}
+    $file=Join-Path $folder ("diagnostic_{0}.txt" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+    $lines|Set-Content $file -Encoding UTF8
+    Clear-Host;$lines|ForEach-Object{Write-Host "  $_"}
+    Write-OK "Отчёт сохранён: $file"
+    Pause-Menu
+}
+# ============================================================
+# MENU 19 - APPLICATION MANAGER
+# ============================================================
+function Menu-Applications {
+    Draw-Header "МЕНЕДЖЕР ПРИЛОЖЕНИЙ - установка через winget"
+    if(-not(Get-Command winget -ErrorAction SilentlyContinue)){Write-FAIL "winget не найден. Установи App Installer из Microsoft Store.";Pause-Menu;return}
+    $apps=@(
+        @{N=1;Name="7-Zip";Id="7zip.7zip"}, @{N=2;Name="VLC";Id="VideoLAN.VLC"},
+        @{N=3;Name="Notepad++";Id="Notepad++.Notepad++"}, @{N=4;Name="PowerToys";Id="Microsoft.PowerToys"},
+        @{N=5;Name="Steam";Id="Valve.Steam"}, @{N=6;Name="Discord";Id="Discord.Discord"},
+        @{N=7;Name="Epic Games Launcher";Id="EpicGames.EpicGamesLauncher"},
+        @{N=8;Name="Firefox";Id="Mozilla.Firefox"}, @{N=9;Name="Brave";Id="Brave.Brave"},
+        @{N=10;Name="qBittorrent";Id="qBittorrent.qBittorrent"}, @{N=11;Name="Bitwarden";Id="Bitwarden.Bitwarden"},
+        @{N=12;Name="Malwarebytes";Id="Malwarebytes.Malwarebytes"}
+    )
+    $packs=@(
+        @{Key="G";Name="Игры";Nums=1,5,6,7}, @{Key="I";Name="Интернет";Nums=8,9,10},
+        @{Key="S";Name="Безопасность";Nums=11,12}, @{Key="B";Name="Базовый";Nums=1,2,3,4}
+    )
+    Write-Host "  Профили:" -ForegroundColor Cyan;$packs|ForEach-Object{Write-Host("  [{0}] {1}: {2}" -f $_.Key,$_.Name,(($_.Nums|ForEach-Object{$apps[$_-1].Name}) -join ', '))}
+    Write-Host "`n  Приложения:" -ForegroundColor Cyan;$apps|ForEach-Object{Write-Host("  [{0,2}] {1,-24} {2}" -f $_.N,$_.Name,$_.Id)}
+    Write-Host "`n  [U] Обновить все установленные приложения" -ForegroundColor Green
+    Write-Host "  [0] Назад`n  Выбор профиля или номера (1,3,5-7): " -NoNewline
+    $choice=(Read-Host).Trim();if($choice -eq '0'){return}
+    if($choice -match '^(?i:u)$'){
+        if(-not(Confirm-ActionPreview @("[WINGET] Обновить все приложения"))){Menu-Applications;return}
+        & winget upgrade --all --accept-package-agreements --accept-source-agreements --silent
+        if($LASTEXITCODE -eq 0){Write-OK "Обновление завершено"}else{Write-FAIL "winget завершился с кодом $LASTEXITCODE"}
+        Pause-Menu;return
+    }
+    $pack=$packs|Where-Object{$_.Key -eq $choice.ToUpper()}|Select-Object -First 1
+    try{$selected=if($pack){@($pack.Nums|ForEach-Object{$apps[$_-1]})}else{@(ConvertTo-NumberList $choice $apps.Count|ForEach-Object{$apps[$_-1]})}}catch{Write-FAIL $_.Exception.Message;Pause-Menu;return}
+    if(-not(Confirm-ActionPreview @($selected|ForEach-Object{"[УСТАНОВИТЬ] $($_.Name) ($($_.Id))"}))){Menu-Applications;return}
+    foreach($app in $selected){Write-INFO "Установка $($app.Name)...";& winget install --id $app.Id --exact --accept-package-agreements --accept-source-agreements --silent;if($LASTEXITCODE -eq 0){Write-OK "$($app.Name): готово"}else{Write-FAIL "$($app.Name): код $LASTEXITCODE"}}
+    Pause-Menu
+}
+# ============================================================
+# MENU 20 - SELF UPDATE
+# ============================================================
+function Get-WinToolsUpdateManifest {
+    $url="https://raw.githubusercontent.com/$Script:Repository/main/version.json"
+    try{return Invoke-RestMethod -Uri $url -TimeoutSec 8 -ErrorAction Stop}catch{return $null}
+}
+function Invoke-WinToolsUpdate {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$manifest,
+        [string]$installRoot = $PSScriptRoot,
+        [string]$downloadBase = "https://raw.githubusercontent.com/$Script:Repository/main"
+    )
+    if (-not $installRoot) { Write-FAIL "Автообновление доступно при запуске из локальной папки"; return $false }
+    $files = @($manifest.files)
+    if ($files.Count -eq 0) { Write-FAIL "Манифест обновления не содержит файлов"; return $false }
+
+    $updateRoot = "$env:ProgramData\WinTools\Update"
+    $backupRoot = "$env:ProgramData\WinTools\Backups"
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss_fff'
+    $stage = Join-Path $updateRoot $stamp
+    $backup = Join-Path $backupRoot $stamp
+    $mutationStarted = $false
+    try {
+        New-Item $stage -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        New-Item $backup -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        $seen = @{}
+        foreach ($file in $files) {
+            $relative = "$($file.path)"
+            if ([string]::IsNullOrWhiteSpace($relative) -or [IO.Path]::IsPathRooted($relative) -or
+                $relative -match '(^|[\\/])\.\.([\\/]|$)' -or $relative -notmatch '^[a-zA-Z0-9_.\\/-]+$') {
+                throw "Unsafe update path: $relative"
+            }
+            if ($seen.ContainsKey($relative.ToLowerInvariant())) { throw "Duplicate update path: $relative" }
+            $seen[$relative.ToLowerInvariant()] = $true
+            if ("$($file.sha256)" -notmatch '^[0-9a-fA-F]{64}$') { throw "Missing or invalid SHA-256: $relative" }
+
+            $temporary = Join-Path $stage $relative
+            $parent = Split-Path $temporary -Parent
+            if (-not (Test-Path $parent)) { New-Item $parent -ItemType Directory -Force -ErrorAction Stop | Out-Null }
+            Invoke-WebRequest -Uri "$downloadBase/$relative" -OutFile $temporary -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+            $hash = (Get-FileHash $temporary -Algorithm SHA256 -ErrorAction Stop).Hash
+            if ($hash -ne "$($file.sha256)") { throw "Hash mismatch: $relative" }
+        }
+
+        # Back up every destination before touching any installed file.
+        foreach ($file in $files) {
+            $relative = "$($file.path)"
+            $target = Join-Path $installRoot $relative
+            if (Test-Path $target) {
+                $saved = Join-Path $backup $relative
+                $parent = Split-Path $saved -Parent
+                if (-not (Test-Path $parent)) { New-Item $parent -ItemType Directory -Force -ErrorAction Stop | Out-Null }
+                Copy-Item $target $saved -Force -ErrorAction Stop
+            }
+        }
+
+        $mutationStarted = $true
+        foreach ($file in $files) {
+            $relative = "$($file.path)"
+            $target = Join-Path $installRoot $relative
+            $parent = Split-Path $target -Parent
+            if (-not (Test-Path $parent)) { New-Item $parent -ItemType Directory -Force -ErrorAction Stop | Out-Null }
+            Copy-Item (Join-Path $stage $relative) $target -Force -ErrorAction Stop
+            $installedHash = (Get-FileHash $target -Algorithm SHA256 -ErrorAction Stop).Hash
+            if ($installedHash -ne "$($file.sha256)") { throw "Installed-file verification failed: $relative" }
+        }
+
+        Write-OK "WinTools обновлён до версии: $($manifest.version)"
+        Write-INFO "Резервная копия: $backup"
+        Write-INFO "Перезапусти WinTools, чтобы использовать новую версию"
+        return $true
+    } catch {
+        $failure = $_.Exception.Message
+        if ($mutationStarted) {
+            $rollbackFailures = 0
+            foreach ($file in $files) {
+                $relative = "$($file.path)"
+                $target = Join-Path $installRoot $relative
+                $saved = Join-Path $backup $relative
+                try {
+                    if (Test-Path $saved) { Copy-Item $saved $target -Force -ErrorAction Stop }
+                    elseif (Test-Path $target) { Remove-Item $target -Force -ErrorAction Stop }
+                } catch { $rollbackFailures++ }
+            }
+            if ($rollbackFailures -eq 0) { Write-INFO "Неудачное обновление отменено; исходные файлы восстановлены" }
+            else { Write-FAIL "Откат не завершён для файлов: $rollbackFailures. Резервная копия: $backup" }
+        }
+        Write-FAIL "Ошибка обновления: $failure"
+        return $false
+    } finally {
+        Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+function Test-WinToolsUpdate([switch]$startupCheck) {
+    $stamp="$env:ProgramData\WinTools\last_update_check.txt"
+    if($startupCheck -and (Test-Path $stamp)){
+        try { if (((Get-Date) - (Get-Item $stamp).LastWriteTime).TotalHours -lt 24) { return } }
+        catch { $null = $_.Exception }
+    }
+    # Record the attempt even when the network is unavailable, so startup is
+    # never delayed by more than one check per 24 hours.
+    $stampFolder = Split-Path $stamp -Parent
+    if (-not (Test-Path $stampFolder)) { New-Item $stampFolder -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null }
+    Set-Content $stamp (Get-Date).ToString("o") -Encoding ASCII -ErrorAction SilentlyContinue
+    $manifest=Get-WinToolsUpdateManifest
+    if(-not $manifest){if(-not $startupCheck){Write-INFO "Не удалось проверить обновления"};return}
+    try { $newer = [version]$manifest.version -gt [version]$Script:WinToolsVersion }
+    catch { if (-not $startupCheck) { Write-FAIL "Некорректная версия в манифесте обновления" }; return }
+    if(-not $newer){if(-not $startupCheck){Write-OK "Установлена последняя версия: $Script:WinToolsVersion"};return}
+    Write-Host "";Write-Host "  Доступно обновление: $Script:WinToolsVersion → $($manifest.version)" -ForegroundColor Green
+    $notes=if($Script:WinToolsLanguage -eq 'ru'){$manifest.notes_ru}else{$manifest.notes_en};@($notes)|ForEach-Object{Write-Host "  • $_" -ForegroundColor White}
+    Write-Host "  [U/Y] Обновить сейчас   [L/N/Enter] Позже: " -NoNewline -ForegroundColor Yellow
+    $answer=(Read-Host).Trim()
+    if($answer -match '^(?i:u|y|yes|д|да)$'){$null=Invoke-WinToolsUpdate $manifest}else{Write-INFO "Обновление отложено. Его можно запустить из пункта [20]"}
+}
+function Menu-Update {
+    Draw-Header "ОБНОВЛЕНИЕ WINTOOLS"
+    Write-Host "  Текущая версия: $Script:WinToolsVersion"
+    Write-Host "  [1] Проверить обновления сейчас" -ForegroundColor Green
+    Write-Host "  [0] Назад"
+    Write-Host "`n  Выбор: " -NoNewline
+    $choice=Read-Host;if($choice -eq '1'){Test-WinToolsUpdate}else{return};Pause-Menu
 }
 
 # ============================================================
@@ -1451,12 +2600,17 @@ function Main-Menu {
         Write-Host "  | 13  |  Встроенные приложения    |  Удалить Xbox, Пасьянс и т.д.    |" -ForegroundColor Yellow
         Write-Host "  | 14  |  Кэш браузеров            |  Очистить Brave/Chrome/Edge разом|" -ForegroundColor Yellow
         Write-Host "  | 15  |  Косметика Windows        |  Классич. меню, расширения файлов|" -ForegroundColor White
+        Write-Host "  | 16  |  Профили системы          |  Игры, баланс, приватность       |" -ForegroundColor Green
+        Write-Host "  | 17  |  Экспорт / импорт         |  Снимки конфигурации JSON        |" -ForegroundColor Magenta
+        Write-Host "  | 18  |  Диагностика              |  Полный отчёт без изменений      |" -ForegroundColor Cyan
+        Write-Host "  | 19  |  Менеджер приложений      |  Пакеты Games/Internet/Security  |" -ForegroundColor Yellow
+        Write-Host "  | 20  |  Обновление WinTools      |  Проверить новую версию          |" -ForegroundColor White
         Write-Host "  +-----+---------------------------+----------------------------------+" -ForegroundColor DarkGray
         Write-Host "  |  0  |  Выход                    |                                  |" -ForegroundColor DarkGray
         Write-Host "  +-----+---------------------------+----------------------------------+" -ForegroundColor DarkGray
         Write-Host ""
         Write-Host "  СОВЕТ: Сначала [11] точка восстановления, потом [1] Службы -> [A]" -ForegroundColor DarkCyan
-        Write-Host "  ВЕРСИЯ: $Script:WinVerName" -ForegroundColor DarkCyan
+        Write-Host "  ВЕРСИЯ WINDOWS: $Script:WinVerName | WINTOOLS: $Script:WinToolsVersion" -ForegroundColor DarkCyan
         Write-Host ""
         Write-Host "  Выбор: " -ForegroundColor White -NoNewline
         $choice = Read-Host
@@ -1477,9 +2631,16 @@ function Main-Menu {
             "13" { Menu-Bloatware }
             "14" { Menu-BrowserCache }
             "15" { Menu-Cosmetics }
+            "16" { Menu-Profiles }
+            "17" { Menu-Snapshots }
+            "18" { Menu-Diagnostics }
+            "19" { Menu-Applications }
+            "20" { Menu-Update }
             "0"  { Clear-Host; exit }
         }
     }
 }
 
+# Check at most once every 24 hours. A failure never blocks startup.
+Test-WinToolsUpdate -startupCheck
 Main-Menu
